@@ -298,6 +298,10 @@ static int h3_init_gnutls(URLContext *h, H3Conn *hc, const char *host)
         return AVERROR_EXTERNAL;
     gnutls_alpn_set_protocols(hc->session, &alpn, 1, GNUTLS_ALPN_MANDATORY);
     gnutls_server_name_set(hc->session, GNUTLS_NAME_DNS, host, strlen(host));
+    /* verify the server certificate chain against the system trust store and
+       match it to the hostname; the handshake fails on an invalid/mismatched
+       cert (TLS verification was previously absent). */
+    gnutls_session_set_verify_cert(hc->session, host, 0);
     return 0;
 }
 
