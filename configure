@@ -2121,6 +2121,8 @@ EXTERNAL_LIBRARY_LIST="
     libquirc
     librabbitmq
     librav1e
+    libnghttp3
+    libngtcp2
     librist
     librsvg
     librtmp
@@ -4141,6 +4143,8 @@ libamqp_protocol_deps="librabbitmq"
 libamqp_protocol_select="network"
 librist_protocol_deps="librist"
 librist_protocol_select="network"
+http3_protocol_deps="libngtcp2 libnghttp3"
+http3_protocol_select="network"
 librtmp_protocol_deps="librtmp"
 librtmpe_protocol_deps="librtmp"
 librtmps_protocol_deps="librtmp"
@@ -7456,6 +7460,8 @@ enabled libquirc          && require libquirc quirc.h quirc_decode -lquirc
 enabled librabbitmq       && require_pkg_config librabbitmq "librabbitmq >= 0.7.1" amqp.h amqp_new_connection
 enabled librav1e          && require_pkg_config librav1e "rav1e >= 0.5.0" rav1e.h rav1e_context_new
 enabled librist           && require_pkg_config librist "librist >= 0.2.7" librist/librist.h rist_receiver_create
+enabled libnghttp3        && require_pkg_config libnghttp3 libnghttp3 nghttp3/nghttp3.h nghttp3_version
+enabled libngtcp2         && require_pkg_config libngtcp2 "libngtcp2 libngtcp2_crypto_gnutls" ngtcp2/ngtcp2.h ngtcp2_version
 enabled librsvg           && require_pkg_config librsvg librsvg-2.0 librsvg-2.0/librsvg/rsvg.h rsvg_handle_new_from_data
 enabled librtmp           && require_pkg_config librtmp librtmp librtmp/rtmp.h RTMP_Socket
 enabled librubberband     && require_pkg_config librubberband "rubberband >= 1.8.1" rubberband/rubberband-c.h rubberband_new -lstdc++ && append librubberband_extralibs "-lstdc++"

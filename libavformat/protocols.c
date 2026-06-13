@@ -66,6 +66,7 @@ extern const URLProtocol ff_dtls_protocol;
 extern const URLProtocol ff_udp_protocol;
 extern const URLProtocol ff_udplite_protocol;
 extern const URLProtocol ff_unix_protocol;
+extern const URLProtocol ff_http3_protocol;
 extern const URLProtocol ff_libamqp_protocol;
 extern const URLProtocol ff_librist_protocol;
 extern const URLProtocol ff_librtmp_protocol;
