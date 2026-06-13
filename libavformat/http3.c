@@ -287,6 +287,11 @@ static int h3_http_recv_data_cb(nghttp3_conn *conn, int64_t stream_id,
 {
     H3Conn *hc = user_data;
     HTTP3Context *c = hc->cur;
+    /* DATA-frame payload is NOT included in nghttp3_conn_read_stream()'s
+       consumed count; credit it to QUIC flow control here, otherwise the
+       receive window never reopens and large transfers stall. */
+    ngtcp2_conn_extend_max_stream_offset(hc->conn, stream_id, datalen);
+    ngtcp2_conn_extend_max_offset(hc->conn, datalen);
     if (!c || stream_id != c->stream_id)
         return 0;
     return h3_buf_append(c, data, datalen) < 0 ? NGHTTP3_ERR_CALLBACK_FAILURE : 0;
