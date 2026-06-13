@@ -34,6 +34,7 @@
 #include <inttypes.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -397,6 +398,10 @@ static int h3_init_quic(URLContext *h, H3Conn *hc)
         return AVERROR_EXTERNAL;
     }
     ngtcp2_conn_set_tls_native_handle(hc->conn, hc->session);
+    /* let ngtcp2 emit keep-alive packets once idle 15s; the pool reaper pumps
+       parked connections so these actually go out and the conn survives the
+       30s idle timeout for reuse by a later request. */
+    ngtcp2_conn_set_keep_alive_timeout(hc->conn, 15 * NGTCP2_SECONDS);
     return 0;
 }
 
@@ -601,6 +606,35 @@ static int h3_dial(URLContext *h, H3Conn *hc, const char *portstr, int64_t timeo
 
 /* ---- pool ---- */
 
+/* Background reaper: pumps parked connections so ngtcp2 sends keep-alive PINGs
+   (keeping them alive past the idle timeout for reuse) and evicts dead ones. */
+static void *h3_reaper(void *arg)
+{
+    for (;;) {
+        int i;
+        av_usleep(3 * 1000000);
+        ff_mutex_lock(&h3_pool_mutex);
+        for (i = 0; i < H3_POOL_MAX; i++) {
+            H3Conn *hc = h3_pool[i];
+            if (!hc)
+                continue;
+            if (h3_pump(NULL, hc, 0) < 0 || !h3_conn_alive(hc)) {
+                h3conn_free(hc);
+                h3_pool[i] = NULL;
+            }
+        }
+        ff_mutex_unlock(&h3_pool_mutex);
+    }
+    return NULL;
+}
+
+static void h3_start_reaper(void)
+{
+    pthread_t t;
+    if (pthread_create(&t, NULL, h3_reaper, NULL) == 0)
+        pthread_detach(t);
+}
+
 static H3Conn *h3_pool_take(const char *host, int port)
 {
     H3Conn *hc = NULL;
@@ -620,8 +654,10 @@ static H3Conn *h3_pool_take(const char *host, int port)
 
 static void h3_pool_put(H3Conn *hc)
 {
+    static AVOnce reaper_once = AV_ONCE_INIT;
     H3Conn *evict = NULL;
     int i;
+    ff_thread_once(&reaper_once, h3_start_reaper);
     ff_mutex_lock(&h3_pool_mutex);
     for (i = 0; i < H3_POOL_MAX; i++) {
         if (!h3_pool[i]) {
