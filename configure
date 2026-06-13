@@ -7462,7 +7462,8 @@ enabled librav1e          && require_pkg_config librav1e "rav1e >= 0.5.0" rav1e.
 enabled librist           && require_pkg_config librist "librist >= 0.2.7" librist/librist.h rist_receiver_create
 enabled libnghttp3        && require_pkg_config libnghttp3 libnghttp3 nghttp3/nghttp3.h nghttp3_version
 enabled libngtcp2         && require_pkg_config libngtcp2 libngtcp2 ngtcp2/ngtcp2.h ngtcp2_version &&
-                             append libngtcp2_extralibs "-lngtcp2_crypto_gnutls"
+                             { add_cflags -I/opt/boringssl/include;
+                               append libngtcp2_extralibs "-lngtcp2_crypto_boringssl -L/opt/boringssl/lib -lssl -lcrypto -lstdc++"; }
 enabled librsvg           && require_pkg_config librsvg librsvg-2.0 librsvg-2.0/librsvg/rsvg.h rsvg_handle_new_from_data
 enabled librtmp           && require_pkg_config librtmp librtmp librtmp/rtmp.h RTMP_Socket
 enabled librubberband     && require_pkg_config librubberband "rubberband >= 1.8.1" rubberband/rubberband-c.h rubberband_new -lstdc++ && append librubberband_extralibs "-lstdc++"
