@@ -66,6 +66,7 @@
 #endif
 #endif
 #if defined(__APPLE__)
+#include <ctype.h>
 #include <Security/Security.h>
 #include <CoreFoundation/CoreFoundation.h>
 #endif
@@ -74,6 +75,7 @@
 #include <nghttp3/nghttp3.h>
 
 #include "libavutil/avstring.h"
+#include "libavutil/base64.h"
 #include "libavutil/error.h"
 #include "libavutil/log.h"
 #include "libavutil/mem.h"
@@ -110,6 +112,8 @@ typedef struct H3Conn {
     uint8_t sr_secret[32];
 
     char host[1024];
+    char vhost[1024];      /* host to verify the cert name against */
+    char ca_file[1024];    /* extra CA anchor file (PEM), "" if none */
     int  port;
 
     HTTP3Context *cur; /* request currently driving this connection */
@@ -152,6 +156,8 @@ struct HTTP3Context {
     int64_t open_timeout_us;
     int altsvc;            /* AVOption: discover h3 via Alt-Svc before connecting */
     int tls_verify;        /* AVOption: verify the server certificate (default on) */
+    char *ca_file;         /* AVOption: extra CA bundle (PEM) */
+    char *verifyhost;      /* AVOption: cert name to verify against */
 };
 
 /* ---- connection pool (host-keyed, N slots, FIFO eviction) ---- */
@@ -334,8 +340,62 @@ static int h3_end_headers_cb(nghttp3_conn *conn, int64_t stream_id, int fin,
 /* Verify the peer's DER certificate chain against the system keychain via
    SecTrust. On iOS there is no /etc/ssl/certs nor SSL_CERT_FILE, so this is
    how the chain (incl. a user-trusted local CA) is validated. */
+/* Load PEM CA certificates from a file into a CFArray of SecCertificateRef
+   for use as extra SecTrust anchors. iOS has no SecItemImport, so parse the
+   PEM blocks ourselves and base64-decode each to DER. NULL on empty/error. */
+static CFArrayRef h3_apple_load_anchors(const char *path)
+{
+    static const char *BEG = "-----BEGIN CERTIFICATE-----";
+    static const char *END = "-----END CERTIFICATE-----";
+    CFMutableArrayRef arr;
+    char *buf, *p;
+    long sz;
+    FILE *f = fopen(path, "rb");
+
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return NULL; }
+    buf = av_malloc(sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    sz = fread(buf, 1, sz, f);
+    fclose(f);
+    buf[sz] = 0;
+
+    arr = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    p = buf;
+    while ((p = strstr(p, BEG))) {
+        char *end = strstr(p += strlen(BEG), END);
+        int blen, j = 0, dl, i;
+        char *b64; uint8_t *der;
+        if (!end)
+            break;
+        blen = (int)(end - p);
+        b64 = av_malloc(blen + 1);
+        der = av_malloc(blen);
+        if (b64 && der) {
+            for (i = 0; i < blen; i++)
+                if (!isspace((unsigned char)p[i]))
+                    b64[j++] = p[i];
+            b64[j] = 0;
+            dl = av_base64_decode(der, b64, blen);
+            if (dl > 0) {
+                CFDataRef d = CFDataCreate(NULL, der, dl);
+                SecCertificateRef cert = d ? SecCertificateCreateWithData(NULL, d) : NULL;
+                if (d) CFRelease(d);
+                if (cert) { CFArrayAppendValue(arr, cert); CFRelease(cert); }
+            }
+        }
+        av_free(b64); av_free(der);
+        p = end + strlen(END);
+    }
+    av_free(buf);
+    if (CFArrayGetCount(arr) == 0) { CFRelease(arr); return NULL; }
+    return arr;
+}
+
 static int h3_apple_verify(const uint8_t **der, const size_t *der_len,
-                           size_t n, const char *host)
+                           size_t n, const char *host, const char *ca_file)
 {
     CFMutableArrayRef certs;
     CFStringRef cfhost;
@@ -375,6 +435,15 @@ static int h3_apple_verify(const uint8_t **der, const size_t *der_len,
             CFRelease(trust);
         return -1;
     }
+    if (ca_file && *ca_file) {
+        CFArrayRef anchors = h3_apple_load_anchors(ca_file);
+        if (anchors) {
+            SecTrustSetAnchorCertificates(trust, anchors);
+            /* keep the system anchors in addition to ours */
+            SecTrustSetAnchorCertificatesOnly(trust, false);
+            CFRelease(anchors);
+        }
+    }
     ok = SecTrustEvaluateWithError(trust, NULL);
     CFRelease(trust);
     return ok ? 0 : -1;
@@ -400,17 +469,21 @@ static int h3_gnutls_verify(gnutls_session_t session)
         der[i] = peers[i].data;
         len[i] = peers[i].size;
     }
-    return h3_apple_verify(der, len, n, hc->host) == 0
+    return h3_apple_verify(der, len, n, hc->vhost, hc->ca_file) == 0
                ? 0 : GNUTLS_E_CERTIFICATE_ERROR;
 }
 #endif
 
 static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
 {
-    int verify = ((HTTP3Context *)h->priv_data)->tls_verify;
+    HTTP3Context *c = h->priv_data;
+    int verify = c->tls_verify;
+    const char *vhost = c->verifyhost && *c->verifyhost ? c->verifyhost : host;
 
     hc->conn_ref.get_conn  = h3_get_conn;
     hc->conn_ref.user_data = hc;
+    av_strlcpy(hc->vhost, vhost, sizeof(hc->vhost));
+    av_strlcpy(hc->ca_file, c->ca_file ? c->ca_file : "", sizeof(hc->ca_file));
 
 #if CONFIG_GNUTLS
     {
@@ -444,11 +517,14 @@ static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
         /* verify the server cert chain + match the hostname; the handshake
            fails on an invalid/mismatched cert. */
         if (verify) {
+            if (c->ca_file && *c->ca_file)
+                gnutls_certificate_set_x509_trust_file(hc->cred, c->ca_file,
+                                                       GNUTLS_X509_FMT_PEM);
 #if defined(__APPLE__)
-            /* validate against the system keychain (no SSL_CERT_FILE on iOS) */
+            /* validate via SecTrust (system keychain + optional ca_file anchor) */
             gnutls_session_set_verify_function(hc->session, h3_gnutls_verify);
 #else
-            gnutls_session_set_verify_cert(hc->session, host, 0);
+            gnutls_session_set_verify_cert(hc->session, vhost, 0);
 #endif
         }
     }
@@ -497,8 +573,11 @@ static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
         /* verify the server cert chain + match the hostname; the handshake
            fails on an invalid/mismatched cert. */
         SSL_set_verify(hc->ssl, verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
-        if (verify)
-            SSL_set1_host(hc->ssl, host);
+        if (verify) {
+            if (c->ca_file && *c->ca_file)
+                SSL_CTX_load_verify_locations(hc->ssl_ctx, c->ca_file, NULL);
+            SSL_set1_host(hc->ssl, vhost);
+        }
     }
 #endif
     return 0;
@@ -1235,6 +1314,12 @@ static const AVOption http3_options[] = {
       AV_OPT_FLAG_DECODING_PARAM },
     { "tls_verify", "verify the server certificate (0 to disable)",
       offsetof(HTTP3Context, tls_verify), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1,
+      AV_OPT_FLAG_DECODING_PARAM },
+    { "ca_file", "additional CA certificate file (PEM) to trust",
+      offsetof(HTTP3Context, ca_file), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0,
+      AV_OPT_FLAG_DECODING_PARAM },
+    { "verifyhost", "hostname to verify the certificate against (default: URL host)",
+      offsetof(HTTP3Context, verifyhost), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0,
       AV_OPT_FLAG_DECODING_PARAM },
     { NULL }
 };
