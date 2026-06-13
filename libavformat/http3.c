@@ -75,6 +75,8 @@ typedef struct HTTP3Context {
     int64_t stream_id;     /* current request stream */
     int     stream_done;   /* response stream finished */
     int     status;        /* HTTP :status of the current response */
+    int     headers_done;  /* response header section complete */
+    char    location[2048];/* Location header (for redirects) */
     int64_t off;           /* logical read position (bytes delivered) */
     int64_t filesize;      /* total resource size, -1 if unknown */
 
@@ -209,7 +211,7 @@ static int h3_recv_header_cb(nghttp3_conn *conn, int64_t stream_id, int32_t toke
 {
     HTTP3Context *c = user_data;
     nghttp3_vec n, v;
-    char vb[128];
+    char vb[2048];
     size_t vn;
 
     if (stream_id != c->stream_id)
@@ -222,6 +224,8 @@ static int h3_recv_header_cb(nghttp3_conn *conn, int64_t stream_id, int32_t toke
 
     if (n.len == 7 && !av_strncasecmp((const char *)n.base, ":status", 7)) {
         c->status = atoi(vb);
+    } else if (n.len == 8 && !av_strncasecmp((const char *)n.base, "location", 8)) {
+        av_strlcpy(c->location, vb, sizeof(c->location));
     } else if (n.len == 13 && !av_strncasecmp((const char *)n.base, "content-range", 13)) {
         /* "bytes X-Y/Z" -> total Z */
         char *slash = strchr(vb, '/');
@@ -241,6 +245,15 @@ static int h3_http_stream_close_cb(nghttp3_conn *conn, int64_t stream_id,
     HTTP3Context *c = user_data;
     if (stream_id == c->stream_id)
         c->stream_done = 1;
+    return 0;
+}
+
+static int h3_end_headers_cb(nghttp3_conn *conn, int64_t stream_id, int fin,
+                             void *user_data, void *stream_user_data)
+{
+    HTTP3Context *c = user_data;
+    if (stream_id == c->stream_id)
+        c->headers_done = 1;
     return 0;
 }
 
@@ -392,6 +405,7 @@ static int h3_setup_http3(URLContext *h, HTTP3Context *c)
     static const nghttp3_callbacks callbacks = {
         .recv_data    = h3_http_recv_data_cb,
         .recv_header  = h3_recv_header_cb,
+        .end_headers  = h3_end_headers_cb,
         .stream_close = h3_http_stream_close_cb,
     };
 
@@ -440,6 +454,7 @@ static int h3_start_request(URLContext *h, HTTP3Context *c, int64_t range_start)
     c->rb_len = c->rb_off = 0;
     c->stream_done = 0;
     c->status = 0;
+    c->headers_done = 0;
 
     if (range_start > 0) {
         snprintf(rangebuf, sizeof(rangebuf), "bytes=%"PRId64"-", range_start);
@@ -594,37 +609,102 @@ static int h3_handshake(URLContext *h, HTTP3Context *c)
 
 /* ---- URLProtocol callbacks ---- */
 
+/* Pump until the response header section is complete (status known). */
+static int h3_await_headers(URLContext *h, HTTP3Context *c)
+{
+    int64_t deadline = av_gettime_relative() + c->open_timeout_us;
+    while (!c->headers_done && !c->stream_done) {
+        int rv;
+        if (av_gettime_relative() > deadline)
+            return AVERROR(ETIMEDOUT);
+        if ((rv = h3_pump(h, c, 1000)) < 0)
+            return rv;
+    }
+    return 0;
+}
+
+/* Bring up one QUIC connection + HTTP/3 to c->host. */
+static int h3_dial(URLContext *h, HTTP3Context *c, const char *portstr)
+{
+    int ret;
+    if ((ret = h3_connect_udp(h, c, c->host, portstr)) < 0) return ret;
+    if ((ret = h3_init_gnutls(h, c, c->host)) < 0)          return ret;
+    if ((ret = h3_init_quic(h, c)) < 0)                      return ret;
+    if ((ret = h3_handshake(h, c)) < 0)                      return ret;
+    if ((ret = h3_setup_http3(h, c)) < 0)                    return ret;
+    return 0;
+}
+
+static void h3_teardown(HTTP3Context *c)
+{
+    if (c->h3conn)  { nghttp3_conn_del(c->h3conn); c->h3conn = NULL; }
+    if (c->conn)    { ngtcp2_conn_del(c->conn);    c->conn = NULL; }
+    if (c->session) { gnutls_deinit(c->session);   c->session = NULL; }
+    if (c->cred)    { gnutls_certificate_free_credentials(c->cred); c->cred = NULL; }
+    if (c->fd >= 0) { close(c->fd); c->fd = -1; }
+    c->stream_id = -1;
+    c->stream_done = c->headers_done = c->status = 0;
+    c->rb_len = c->rb_off = 0;
+}
+
+static int h3_status_error(int s)
+{
+    switch (s) {
+    case 400: return AVERROR_HTTP_BAD_REQUEST;
+    case 401: return AVERROR_HTTP_UNAUTHORIZED;
+    case 403: return AVERROR_HTTP_FORBIDDEN;
+    case 404: return AVERROR_HTTP_NOT_FOUND;
+    case 429: return AVERROR_HTTP_TOO_MANY_REQUESTS;
+    default:  return s >= 500 ? AVERROR_HTTP_SERVER_ERROR : AVERROR_HTTP_OTHER_4XX;
+    }
+}
+
 static int http3_open(URLContext *h, const char *uri, int flags)
 {
     HTTP3Context *c = h->priv_data;
-    int port = -1, ret;
-    char portstr[12];
+    int port, ret, redirects = 0;
+    char portstr[12], nexturi[4096];
 
     c->fd = -1;
     c->stream_id = -1;
-    c->filesize = -1;
     c->off = 0;
     c->open_timeout_us = 15 * 1000000;
-
-    av_url_split(NULL, 0, NULL, 0, c->host, sizeof(c->host), &port,
-                 c->path, sizeof(c->path), uri);
-    if (port < 0)
-        port = 443;
-    if (!c->path[0])
-        av_strlcpy(c->path, "/", sizeof(c->path));
-    snprintf(portstr, sizeof(portstr), "%d", port);
 
     if (gnutls_global_init() != 0)
         return AVERROR_EXTERNAL;
 
-    if ((ret = h3_connect_udp(h, c, c->host, portstr)) < 0) goto fail;
-    if ((ret = h3_init_gnutls(h, c, c->host)) < 0)          goto fail;
-    if ((ret = h3_init_quic(h, c)) < 0)                      goto fail;
-    if ((ret = h3_handshake(h, c)) < 0)                      goto fail;
-    if ((ret = h3_setup_http3(h, c)) < 0)                    goto fail;
-    if ((ret = h3_start_request(h, c, 0)) < 0)               goto fail;
+    av_strlcpy(nexturi, uri, sizeof(nexturi));
+    for (;;) {
+        port = -1;
+        c->filesize = -1;
+        av_url_split(NULL, 0, NULL, 0, c->host, sizeof(c->host), &port,
+                     c->path, sizeof(c->path), nexturi);
+        if (port < 0)
+            port = 443;
+        if (!c->path[0])
+            av_strlcpy(c->path, "/", sizeof(c->path));
+        snprintf(portstr, sizeof(portstr), "%d", port);
 
-    av_log(h, AV_LOG_INFO, "http3: GET https://%s%s over HTTP/3\n", c->host, c->path);
+        if ((ret = h3_dial(h, c, portstr)) < 0)            goto fail;
+        if ((ret = h3_start_request(h, c, 0)) < 0)         goto fail;
+        if ((ret = h3_await_headers(h, c)) < 0)            goto fail;
+
+        if (c->status >= 300 && c->status < 400 && c->location[0]) {
+            if (++redirects > 8) { ret = AVERROR(ELOOP); goto fail; }
+            av_log(h, AV_LOG_VERBOSE, "http3: %d redirect -> %s\n", c->status, c->location);
+            if (av_strstart(c->location, "http", NULL))
+                av_strlcpy(nexturi, c->location, sizeof(nexturi));
+            else /* relative */
+                snprintf(nexturi, sizeof(nexturi), "http3://%s:%d%s", c->host, port, c->location);
+            h3_teardown(c);
+            continue;
+        }
+        if (c->status >= 400) { ret = h3_status_error(c->status); goto fail; }
+        break; /* 2xx */
+    }
+
+    av_log(h, AV_LOG_INFO, "http3: GET https://%s%s -> %d over HTTP/3\n",
+           c->host, c->path, c->status);
     return 0;
 fail:
     return ret;
