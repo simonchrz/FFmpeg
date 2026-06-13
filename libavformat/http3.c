@@ -15,12 +15,14 @@
  */
 
 /*
- * Milestone 2 / stage B1: establish a QUIC connection (UDP + ngtcp2 transport +
- * TLS1.3 via the GnuTLS crypto helper) to an HTTP/3 origin and complete the
- * handshake. No HTTP/3 request/body yet (nghttp3 comes in B2) — url_read returns
- * EOF. Proves the transport + TLS + event-pump bridge from inside libavformat.
+ * Milestone 2 / stage B2: QUIC transport (ngtcp2 + GnuTLS crypto helper) plus
+ * an HTTP/3 client (nghttp3): open a bidi stream, submit a GET, pump the
+ * connection and deliver the response body through url_read. A minimal but real
+ * HTTP/3 GET from inside libavformat. Range/seek + connection reuse + HLS wiring
+ * are later milestones.
  */
 
+#include <stdio.h>
 #include <netdb.h>
 #include <poll.h>
 #include <string.h>
@@ -33,23 +35,26 @@
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_gnutls.h>
+#include <nghttp3/nghttp3.h>
 
 #include "libavutil/avstring.h"
 #include "libavutil/error.h"
 #include "libavutil/log.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
 #include "avformat.h"
 #include "url.h"
 
-#define H3_ALPN "h3"
-#define H3_RECV_BUF 65536
+#define H3_ALPN     "h3"
+#define H3_DGRAM    65536
 
 typedef struct HTTP3Context {
     const AVClass *class;
 
     int fd;
     ngtcp2_conn *conn;
+    nghttp3_conn *h3conn;
     ngtcp2_crypto_conn_ref conn_ref;
 
     gnutls_session_t session;
@@ -60,9 +65,19 @@ typedef struct HTTP3Context {
     struct sockaddr_storage remote_addr;
     socklen_t              remote_addrlen;
 
-    uint8_t sr_secret[32]; /* stateless-reset token secret */
+    uint8_t sr_secret[32];
 
-    int handshake_done;
+    char host[1024];
+    char path[2048];
+
+    int64_t stream_id;     /* request stream */
+    int     stream_done;   /* response stream finished */
+
+    /* response body buffer */
+    unsigned char *rb;
+    size_t rb_size, rb_len, rb_off;
+    size_t total_recv;
+
     int64_t open_timeout_us;
 } HTTP3Context;
 
@@ -80,6 +95,24 @@ static ngtcp2_conn *h3_get_conn(ngtcp2_crypto_conn_ref *ref)
     HTTP3Context *c = ref->user_data;
     return c->conn;
 }
+
+static int h3_buf_append(HTTP3Context *c, const uint8_t *data, size_t len)
+{
+    if (c->rb_len + len > c->rb_size) {
+        size_t ns = FFMAX(c->rb_size * 2, c->rb_len + len);
+        unsigned char *nb = av_realloc(c->rb, ns);
+        if (!nb)
+            return AVERROR(ENOMEM);
+        c->rb = nb;
+        c->rb_size = ns;
+    }
+    memcpy(c->rb + c->rb_len, data, len);
+    c->rb_len += len;
+    c->total_recv += len;
+    return 0;
+}
+
+/* ---- ngtcp2 callbacks (mostly crypto defaults; a few custom) ---- */
 
 static void h3_rand_cb(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *ctx)
 {
@@ -99,12 +132,85 @@ static int h3_get_new_cid_cb(ngtcp2_conn *conn, ngtcp2_cid *cid, uint8_t *token,
     return 0;
 }
 
+static int h3_recv_stream_data_cb(ngtcp2_conn *conn, uint32_t flags,
+                                  int64_t stream_id, uint64_t offset,
+                                  const uint8_t *data, size_t datalen,
+                                  void *user_data, void *stream_user_data)
+{
+    HTTP3Context *c = user_data;
+    nghttp3_ssize n;
+
+    if (!c->h3conn)
+        return 0;
+    n = nghttp3_conn_read_stream(c->h3conn, stream_id, data, datalen,
+                                 flags & NGTCP2_STREAM_DATA_FLAG_FIN);
+    if (n < 0)
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    ngtcp2_conn_extend_max_stream_offset(conn, stream_id, (uint64_t)n);
+    ngtcp2_conn_extend_max_offset(conn, (uint64_t)n);
+    return 0;
+}
+
+static int h3_acked_stream_data_cb(ngtcp2_conn *conn, int64_t stream_id,
+                                   uint64_t offset, uint64_t datalen,
+                                   void *user_data, void *stream_user_data)
+{
+    HTTP3Context *c = user_data;
+    if (c->h3conn)
+        nghttp3_conn_add_ack_offset(c->h3conn, stream_id, datalen);
+    return 0;
+}
+
+static int h3_stream_close_cb(ngtcp2_conn *conn, uint32_t flags,
+                              int64_t stream_id, uint64_t app_error_code,
+                              void *user_data, void *stream_user_data)
+{
+    HTTP3Context *c = user_data;
+    if (c->h3conn) {
+        if (!app_error_code)
+            app_error_code = NGHTTP3_H3_NO_ERROR;
+        nghttp3_conn_close_stream(c->h3conn, stream_id, app_error_code);
+    }
+    if (stream_id == c->stream_id)
+        c->stream_done = 1;
+    return 0;
+}
+
+static int h3_extend_max_stream_data_cb(ngtcp2_conn *conn, int64_t stream_id,
+                                        uint64_t max_data, void *user_data,
+                                        void *stream_user_data)
+{
+    HTTP3Context *c = user_data;
+    if (c->h3conn)
+        nghttp3_conn_unblock_stream(c->h3conn, stream_id);
+    return 0;
+}
+
+/* ---- nghttp3 callback: response body ---- */
+
+static int h3_http_recv_data_cb(nghttp3_conn *conn, int64_t stream_id,
+                                const uint8_t *data, size_t datalen,
+                                void *user_data, void *stream_user_data)
+{
+    HTTP3Context *c = user_data;
+    return h3_buf_append(c, data, datalen) < 0 ? NGHTTP3_ERR_CALLBACK_FAILURE : 0;
+}
+
+static int h3_http_stream_close_cb(nghttp3_conn *conn, int64_t stream_id,
+                                   uint64_t app_error_code, void *user_data,
+                                   void *stream_user_data)
+{
+    HTTP3Context *c = user_data;
+    if (stream_id == c->stream_id)
+        c->stream_done = 1;
+    return 0;
+}
+
 /* ---- gnutls TLS session ---- */
 
 static int h3_init_gnutls(URLContext *h, HTTP3Context *c, const char *host)
 {
     int rv;
-    /* QUIC requires TLS1.3 only; this is ngtcp2's canonical client priority. */
     static const char priority[] =
         "%DISABLE_TLS13_COMPAT_MODE:NORMAL:-VERS-ALL:+VERS-TLS1.3:"
         "-CIPHER-ALL:+AES-128-GCM:+AES-256-GCM:+CHACHA20-POLY1305:+AES-128-CCM:"
@@ -112,33 +218,25 @@ static int h3_init_gnutls(URLContext *h, HTTP3Context *c, const char *host)
         "+GROUP-X25519:+GROUP-X448";
     gnutls_datum_t alpn = { (unsigned char *)H3_ALPN, sizeof(H3_ALPN) - 1 };
 
-    if ((rv = gnutls_certificate_allocate_credentials(&c->cred)) != 0) {
-        av_log(h, AV_LOG_ERROR, "gnutls cred alloc: %s\n", gnutls_strerror(rv));
+    if ((rv = gnutls_certificate_allocate_credentials(&c->cred)) != 0)
         return AVERROR_EXTERNAL;
-    }
     gnutls_certificate_set_x509_system_trust(c->cred);
 
-    if ((rv = gnutls_init(&c->session, GNUTLS_CLIENT)) != 0) {
-        av_log(h, AV_LOG_ERROR, "gnutls_init: %s\n", gnutls_strerror(rv));
+    if ((rv = gnutls_init(&c->session, GNUTLS_CLIENT)) != 0)
         return AVERROR_EXTERNAL;
-    }
     if ((rv = gnutls_priority_set_direct(c->session, priority, NULL)) != 0) {
         av_log(h, AV_LOG_ERROR, "gnutls priority: %s\n", gnutls_strerror(rv));
         return AVERROR_EXTERNAL;
     }
-    if (ngtcp2_crypto_gnutls_configure_client_session(c->session) != 0) {
-        av_log(h, AV_LOG_ERROR, "ngtcp2 gnutls client session config failed\n");
+    if (ngtcp2_crypto_gnutls_configure_client_session(c->session) != 0)
         return AVERROR_EXTERNAL;
-    }
 
     c->conn_ref.get_conn  = h3_get_conn;
     c->conn_ref.user_data = c;
     gnutls_session_set_ptr(c->session, &c->conn_ref);
 
-    if ((rv = gnutls_credentials_set(c->session, GNUTLS_CRD_CERTIFICATE, c->cred)) != 0) {
-        av_log(h, AV_LOG_ERROR, "gnutls creds set: %s\n", gnutls_strerror(rv));
+    if ((rv = gnutls_credentials_set(c->session, GNUTLS_CRD_CERTIFICATE, c->cred)) != 0)
         return AVERROR_EXTERNAL;
-    }
     gnutls_alpn_set_protocols(c->session, &alpn, 1, GNUTLS_ALPN_MANDATORY);
     gnutls_server_name_set(c->session, GNUTLS_NAME_DNS, host, strlen(host));
     return 0;
@@ -171,10 +269,8 @@ static int h3_connect_udp(URLContext *h, HTTP3Context *c,
         fd = -1;
     }
     freeaddrinfo(res);
-    if (fd < 0) {
-        av_log(h, AV_LOG_ERROR, "could not connect UDP socket to %s:%s\n", host, port);
+    if (fd < 0)
         return AVERROR(EIO);
-    }
     c->local_addrlen = sizeof(c->local_addr);
     getsockname(fd, (struct sockaddr *)&c->local_addr, &c->local_addrlen);
     c->fd = fd;
@@ -205,10 +301,13 @@ static int h3_init_quic(URLContext *h, HTTP3Context *c)
         .version_negotiation      = ngtcp2_crypto_version_negotiation_cb,
         .rand                     = h3_rand_cb,
         .get_new_connection_id    = h3_get_new_cid_cb,
+        .recv_stream_data         = h3_recv_stream_data_cb,
+        .acked_stream_data_offset = h3_acked_stream_data_cb,
+        .stream_close             = h3_stream_close_cb,
+        .extend_max_stream_data   = h3_extend_max_stream_data_cb,
     };
 
     gnutls_rnd(GNUTLS_RND_RANDOM, c->sr_secret, sizeof(c->sr_secret));
-
     scid.datalen = 17;
     gnutls_rnd(GNUTLS_RND_RANDOM, scid.data, scid.datalen);
     dcid.datalen = 18;
@@ -219,8 +318,12 @@ static int h3_init_quic(URLContext *h, HTTP3Context *c)
 
     ngtcp2_transport_params_default(&params);
     params.initial_max_streams_uni            = 3;
-    params.initial_max_stream_data_bidi_local = 256 * 1024;
-    params.initial_max_data                   = 1024 * 1024;
+    params.initial_max_stream_data_bidi_local = 1024 * 1024;
+    /* The server's control + QPACK streams are unidirectional and send to us;
+       without a non-zero uni stream-data limit it can't write its control stream
+       (server closes with H3_INTERNAL_ERROR "Error opening control stream"). */
+    params.initial_max_stream_data_uni        = 256 * 1024;
+    params.initial_max_data                   = 4 * 1024 * 1024;
     params.max_idle_timeout                   = 30 * NGTCP2_SECONDS;
     params.active_connection_id_limit         = 7;
 
@@ -241,35 +344,120 @@ static int h3_init_quic(URLContext *h, HTTP3Context *c)
     return 0;
 }
 
+/* ---- HTTP/3 layer ---- */
+
+static int h3_setup_http3(URLContext *h, HTTP3Context *c)
+{
+    nghttp3_settings settings;
+    int64_t ctrl_id, enc_id, dec_id;
+    int rv;
+    static const nghttp3_callbacks callbacks = {
+        .recv_data    = h3_http_recv_data_cb,
+        .stream_close = h3_http_stream_close_cb,
+    };
+
+    nghttp3_settings_default(&settings);
+    settings.qpack_max_dtable_capacity = 4096;
+    settings.qpack_blocked_streams     = 100;
+
+    rv = nghttp3_conn_client_new(&c->h3conn, &callbacks, &settings,
+                                 nghttp3_mem_default(), c);
+    if (rv != 0) {
+        av_log(h, AV_LOG_ERROR, "nghttp3_conn_client_new: %s\n", nghttp3_strerror(rv));
+        return AVERROR_EXTERNAL;
+    }
+
+    if (ngtcp2_conn_open_uni_stream(c->conn, &ctrl_id, NULL) != 0 ||
+        nghttp3_conn_bind_control_stream(c->h3conn, ctrl_id) != 0)
+        return AVERROR_EXTERNAL;
+    if (ngtcp2_conn_open_uni_stream(c->conn, &enc_id, NULL) != 0 ||
+        ngtcp2_conn_open_uni_stream(c->conn, &dec_id, NULL) != 0 ||
+        nghttp3_conn_bind_qpack_streams(c->h3conn, enc_id, dec_id) != 0)
+        return AVERROR_EXTERNAL;
+    return 0;
+}
+
+static int h3_submit_request(URLContext *h, HTTP3Context *c)
+{
+    int rv;
+#define MK_NV(N, V) { (uint8_t *)(N), (uint8_t *)(V), sizeof(N) - 1, strlen(V), NGHTTP3_NV_FLAG_NONE }
+    nghttp3_nv nva[] = {
+        MK_NV(":method", "GET"),
+        MK_NV(":scheme", "https"),
+        { (uint8_t *)":authority", (uint8_t *)c->host, sizeof(":authority") - 1, strlen(c->host), NGHTTP3_NV_FLAG_NONE },
+        { (uint8_t *)":path",      (uint8_t *)c->path, sizeof(":path") - 1,      strlen(c->path), NGHTTP3_NV_FLAG_NONE },
+        MK_NV("user-agent", "ffmpeg-http3/0.1"),
+    };
+
+    if (ngtcp2_conn_open_bidi_stream(c->conn, &c->stream_id, NULL) != 0)
+        return AVERROR_EXTERNAL;
+    rv = nghttp3_conn_submit_request(c->h3conn, c->stream_id, nva,
+                                     FF_ARRAY_ELEMS(nva), NULL, c);
+    if (rv != 0) {
+        av_log(h, AV_LOG_ERROR, "submit_request: %s\n", nghttp3_strerror(rv));
+        return AVERROR_EXTERNAL;
+    }
+    return 0;
+}
+
 /* ---- I/O pump ---- */
 
-/* Drain all packets ngtcp2 wants to send. */
-static int h3_write_packets(URLContext *h, HTTP3Context *c)
+static int h3_write(URLContext *h, HTTP3Context *c)
 {
     uint8_t buf[1452];
     ngtcp2_path_storage ps;
     ngtcp2_pkt_info pi;
-    ngtcp2_ssize n;
+    nghttp3_vec vec[16];
 
     ngtcp2_path_storage_zero(&ps);
     for (;;) {
-        n = ngtcp2_conn_write_pkt(c->conn, &ps.path, &pi, buf, sizeof(buf),
-                                  h3_timestamp());
-        if (n < 0) {
-            av_log(h, AV_LOG_ERROR, "write_pkt: %s\n", ngtcp2_strerror((int)n));
+        int64_t stream_id = -1;
+        int fin = 0;
+        nghttp3_ssize sveccnt = 0;
+        ngtcp2_ssize ndatalen, nwrite;
+        uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
+
+        if (c->h3conn) {
+            sveccnt = nghttp3_conn_writev_stream(c->h3conn, &stream_id, &fin,
+                                                 vec, FF_ARRAY_ELEMS(vec));
+            if (sveccnt < 0)
+                return AVERROR_EXTERNAL;
+        }
+        if (fin)
+            flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+
+        nwrite = ngtcp2_conn_writev_stream(c->conn, &ps.path, &pi, buf, sizeof(buf),
+                                           &ndatalen, flags, stream_id,
+                                           (const ngtcp2_vec *)vec,
+                                           (size_t)sveccnt, h3_timestamp());
+        if (nwrite < 0) {
+            if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+                nghttp3_conn_block_stream(c->h3conn, stream_id);
+                continue;
+            }
+            if (nwrite == NGTCP2_ERR_STREAM_SHUT_WR) {
+                nghttp3_conn_shutdown_stream_write(c->h3conn, stream_id);
+                continue;
+            }
+            if (nwrite == NGTCP2_ERR_WRITE_MORE) {
+                nghttp3_conn_add_write_offset(c->h3conn, stream_id, ndatalen);
+                continue;
+            }
+            av_log(h, AV_LOG_ERROR, "writev_stream: %s\n", ngtcp2_strerror((int)nwrite));
             return AVERROR_EXTERNAL;
         }
-        if (n == 0)
-            return 0; /* nothing more to send right now */
-        if (send(c->fd, buf, n, 0) < 0)
+        if (ndatalen >= 0)
+            nghttp3_conn_add_write_offset(c->h3conn, stream_id, ndatalen);
+        if (nwrite == 0)
+            return 0;
+        if (send(c->fd, buf, nwrite, 0) < 0)
             return AVERROR(EIO);
     }
 }
 
-/* Feed one or more received datagrams into ngtcp2. */
-static int h3_read_packet(URLContext *h, HTTP3Context *c)
+static int h3_read_socket(URLContext *h, HTTP3Context *c)
 {
-    uint8_t buf[H3_RECV_BUF];
+    uint8_t buf[H3_DGRAM];
     ngtcp2_path path;
     ngtcp2_pkt_info pi = { 0 };
     ssize_t nread;
@@ -287,51 +475,58 @@ static int h3_read_packet(URLContext *h, HTTP3Context *c)
 
     rv = ngtcp2_conn_read_pkt(c->conn, &path, &pi, buf, nread, h3_timestamp());
     if (rv != 0) {
-        av_log(h, AV_LOG_ERROR, "read_pkt: %s\n", ngtcp2_strerror(rv));
+        const ngtcp2_ccerr *e = ngtcp2_conn_get_ccerr(c->conn);
+        av_log(h, AV_LOG_ERROR, "read_pkt: %s; ccerr type=%d code=0x%"PRIx64" reason=%.*s\n",
+               ngtcp2_strerror(rv), e ? e->type : -1,
+               e ? (uint64_t)e->error_code : 0,
+               e ? (int)e->reasonlen : 0, e ? (const char *)e->reason : "");
         return AVERROR_EXTERNAL;
     }
     return 0;
 }
 
-/* Run the event loop until the QUIC handshake completes (or timeout/error). */
+/* One pump cycle: send pending, wait, receive. */
+static int h3_pump(URLContext *h, HTTP3Context *c, int timeout_ms)
+{
+    struct pollfd pfd = { .fd = c->fd, .events = POLLIN };
+    ngtcp2_tstamp expiry;
+    uint64_t now;
+    int pr, d;
+
+    if (h3_write(h, c) < 0)
+        return AVERROR_EXTERNAL;
+
+    expiry = ngtcp2_conn_get_expiry(c->conn);
+    now = h3_timestamp();
+    if (expiry != UINT64_MAX) {
+        d = (int)(expiry > now ? (expiry - now) / 1000000 : 0);
+        if (d < timeout_ms)
+            timeout_ms = d;
+    }
+
+    pr = poll(&pfd, 1, timeout_ms);
+    if (pr < 0)
+        return AVERROR(EIO);
+    if (pr > 0 && (pfd.revents & POLLIN)) {
+        int rv = h3_read_socket(h, c);
+        if (rv < 0)
+            return rv;
+    } else if (ngtcp2_conn_handle_expiry(c->conn, h3_timestamp()) != 0) {
+        return AVERROR_EXTERNAL;
+    }
+    return h3_write(h, c);
+}
+
 static int h3_handshake(URLContext *h, HTTP3Context *c)
 {
     int64_t deadline = av_gettime_relative() + c->open_timeout_us;
-
-    if (h3_write_packets(h, c) < 0)
-        return AVERROR_EXTERNAL;
-
     while (!ngtcp2_conn_get_handshake_completed(c->conn)) {
-        ngtcp2_tstamp expiry = ngtcp2_conn_get_expiry(c->conn);
-        uint64_t now = h3_timestamp();
-        int timeout_ms = 1000;
-        struct pollfd pfd = { .fd = c->fd, .events = POLLIN };
-        int pr;
-
-        if (expiry != UINT64_MAX) {
-            int64_t d = (int64_t)(expiry > now ? (expiry - now) / 1000000 : 0);
-            if (d < timeout_ms)
-                timeout_ms = (int)d;
-        }
-        if (av_gettime_relative() > deadline) {
-            av_log(h, AV_LOG_ERROR, "QUIC handshake timed out\n");
+        int rv;
+        if (av_gettime_relative() > deadline)
             return AVERROR(ETIMEDOUT);
-        }
-
-        pr = poll(&pfd, 1, timeout_ms);
-        if (pr < 0)
-            return AVERROR(EIO);
-        if (pr > 0 && (pfd.revents & POLLIN)) {
-            int rv = h3_read_packet(h, c);
-            if (rv < 0)
-                return rv;
-        } else {
-            /* timer fired */
-            if (ngtcp2_conn_handle_expiry(c->conn, h3_timestamp()) != 0)
-                return AVERROR_EXTERNAL;
-        }
-        if (h3_write_packets(h, c) < 0)
-            return AVERROR_EXTERNAL;
+        rv = h3_pump(h, c, 1000);
+        if (rv < 0)
+            return rv;
     }
     return 0;
 }
@@ -341,51 +536,68 @@ static int h3_handshake(URLContext *h, HTTP3Context *c)
 static int http3_open(URLContext *h, const char *uri, int flags)
 {
     HTTP3Context *c = h->priv_data;
-    char host[1024], path[2048];
-    int port = -1;
+    int port = -1, ret;
     char portstr[12];
-    int ret;
 
     c->fd = -1;
-    c->open_timeout_us = 10 * 1000000;
+    c->stream_id = -1;
+    c->open_timeout_us = 15 * 1000000;
 
-    av_url_split(NULL, 0, NULL, 0, host, sizeof(host), &port,
-                 path, sizeof(path), uri);
+    av_url_split(NULL, 0, NULL, 0, c->host, sizeof(c->host), &port,
+                 c->path, sizeof(c->path), uri);
     if (port < 0)
         port = 443;
+    if (!c->path[0])
+        av_strlcpy(c->path, "/", sizeof(c->path));
     snprintf(portstr, sizeof(portstr), "%d", port);
 
     if (gnutls_global_init() != 0)
         return AVERROR_EXTERNAL;
 
-    if ((ret = h3_connect_udp(h, c, host, portstr)) < 0)
-        goto fail;
-    if ((ret = h3_init_gnutls(h, c, host)) < 0)
-        goto fail;
-    if ((ret = h3_init_quic(h, c)) < 0)
-        goto fail;
-    if ((ret = h3_handshake(h, c)) < 0)
-        goto fail;
+    if ((ret = h3_connect_udp(h, c, c->host, portstr)) < 0) goto fail;
+    if ((ret = h3_init_gnutls(h, c, c->host)) < 0)          goto fail;
+    if ((ret = h3_init_quic(h, c)) < 0)                      goto fail;
+    if ((ret = h3_handshake(h, c)) < 0)                      goto fail;
+    if ((ret = h3_setup_http3(h, c)) < 0)                    goto fail;
+    if ((ret = h3_submit_request(h, c)) < 0)                 goto fail;
 
-    c->handshake_done = 1;
-    av_log(h, AV_LOG_INFO,
-           "http3: QUIC handshake completed to %s:%d (B1 — no HTTP/3 body yet)\n",
-           host, port);
+    av_log(h, AV_LOG_INFO, "http3: GET https://%s%s over HTTP/3\n", c->host, c->path);
     return 0;
-
 fail:
     return ret;
 }
 
 static int http3_read(URLContext *h, unsigned char *buf, int size)
 {
-    /* B1: transport only — body fetch (nghttp3) lands in B2. */
-    return AVERROR_EOF;
+    HTTP3Context *c = h->priv_data;
+    int64_t deadline = av_gettime_relative() + c->open_timeout_us;
+
+    while (c->rb_off >= c->rb_len) {
+        int rv;
+        if (c->stream_done)
+            return AVERROR_EOF;
+        if (av_gettime_relative() > deadline)
+            return AVERROR(ETIMEDOUT);
+        rv = h3_pump(h, c, 1000);
+        if (rv < 0)
+            return rv;
+    }
+    {
+        int n = (int)FFMIN((size_t)size, c->rb_len - c->rb_off);
+        memcpy(buf, c->rb + c->rb_off, n);
+        c->rb_off += n;
+        if (c->rb_off >= c->rb_len)
+            c->rb_off = c->rb_len = 0;
+        return n;
+    }
 }
 
 static int http3_close(URLContext *h)
 {
     HTTP3Context *c = h->priv_data;
+    av_log(h, AV_LOG_INFO, "http3: received %zu body bytes over HTTP/3\n", c->total_recv);
+    if (c->h3conn)
+        nghttp3_conn_del(c->h3conn);
     if (c->conn)
         ngtcp2_conn_del(c->conn);
     if (c->session)
@@ -394,6 +606,7 @@ static int http3_close(URLContext *h)
         gnutls_certificate_free_credentials(c->cred);
     if (c->fd >= 0)
         close(c->fd);
+    av_freep(&c->rb);
     return 0;
 }
 
