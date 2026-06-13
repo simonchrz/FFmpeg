@@ -101,6 +101,7 @@ struct HTTP3Context {
     size_t total_recv;
 
     int64_t open_timeout_us;
+    int altsvc;            /* AVOption: discover h3 via Alt-Svc before connecting */
 };
 
 /* ---- connection pool (host-keyed, N slots, FIFO eviction) ---- */
@@ -747,6 +748,83 @@ static int h3_status_error(int s)
 
 /* ---- URLProtocol ---- */
 
+/* Alt-Svc discovery: a plain TLS-over-TCP HTTP/1.1 HEAD to learn whether the
+   origin advertises HTTP/3 and on which port (RFC 9114 §3.1.1). Returns the
+   advertised h3 port, or <0 if none. This is the "upgrade" path: instead of
+   blindly assuming h3 (prior knowledge), confirm + discover the port first. */
+static int h3_altsvc_probe(URLContext *h, const char *host, int port)
+{
+    struct addrinfo hints = { 0 }, *res = NULL, *ai;
+    gnutls_session_t s = NULL;
+    gnutls_certificate_credentials_t cred = NULL;
+    char portstr[12], req[512], buf[8192];
+    int fd = -1, ret = AVERROR(EIO), rv, off = 0;
+    char *as, *eol, *h3, *v, *end, *colon;
+
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0)
+        return AVERROR(EIO);
+    for (ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd); fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0)
+        return AVERROR(EIO);
+
+    if (gnutls_certificate_allocate_credentials(&cred) != 0) goto out;
+    gnutls_certificate_set_x509_system_trust(cred);
+    if (gnutls_init(&s, GNUTLS_CLIENT) != 0) goto out;
+    gnutls_set_default_priority(s);
+    gnutls_credentials_set(s, GNUTLS_CRD_CERTIFICATE, cred);
+    gnutls_server_name_set(s, GNUTLS_NAME_DNS, host, strlen(host));
+    gnutls_session_set_verify_cert(s, host, 0);
+    gnutls_transport_set_int(s, fd);
+    gnutls_handshake_set_timeout(s, 5000);
+    do { rv = gnutls_handshake(s); } while (rv < 0 && !gnutls_error_is_fatal(rv));
+    if (rv < 0) { av_log(h, AV_LOG_WARNING, "alt-svc probe TLS: %s\n", gnutls_strerror(rv)); goto out; }
+
+    snprintf(req, sizeof(req),
+             "HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: ffmpeg-http3/0.1\r\nConnection: close\r\n\r\n",
+             host);
+    gnutls_record_send(s, req, strlen(req));
+
+    while (off < (int)sizeof(buf) - 1) {
+        rv = gnutls_record_recv(s, buf + off, sizeof(buf) - 1 - off);
+        if (rv == GNUTLS_E_AGAIN || rv == GNUTLS_E_INTERRUPTED) continue;
+        if (rv <= 0) break;
+        off += rv;
+        buf[off] = 0;
+        if (strstr(buf, "\r\n\r\n")) break; /* headers complete */
+    }
+    buf[off] = 0;
+
+    as = av_stristr(buf, "alt-svc:");
+    if (!as) { ret = AVERROR(EPROTONOSUPPORT); goto out; }
+    if ((eol = strstr(as, "\r\n"))) *eol = 0;
+    h3 = av_stristr(as, "h3=");
+    if (!h3) { ret = AVERROR(EPROTONOSUPPORT); goto out; }
+    v = h3 + 3;
+    if (*v == '"') v++;
+    end = v;
+    while (*end && *end != '"' && *end != ';' && *end != ',') end++;
+    *end = 0;
+    colon = strrchr(v, ':');
+    ret = colon ? atoi(colon + 1) : port;
+    if (ret <= 0) ret = port;
+    av_log(h, AV_LOG_INFO, "http3: Alt-Svc advertises h3 on port %d\n", ret);
+
+out:
+    if (s)    { gnutls_bye(s, GNUTLS_SHUT_WR); gnutls_deinit(s); }
+    if (cred) gnutls_certificate_free_credentials(cred);
+    if (fd >= 0) close(fd);
+    return ret;
+}
+
 static int http3_open(URLContext *h, const char *uri, int flags)
 {
     HTTP3Context *c = h->priv_data;
@@ -771,6 +849,19 @@ static int http3_open(URLContext *h, const char *uri, int flags)
         if (!c->path[0])
             av_strlcpy(c->path, "/", sizeof(c->path));
         snprintf(portstr, sizeof(portstr), "%d", port);
+
+        if (c->altsvc) {
+            int p3 = h3_altsvc_probe(h, host, port);
+            if (p3 < 0) {
+                av_log(h, AV_LOG_ERROR, "http3: %s:%d does not advertise HTTP/3\n", host, port);
+                ret = p3;
+                goto fail;
+            }
+            if (p3 != port) {
+                port = p3;
+                snprintf(portstr, sizeof(portstr), "%d", port);
+            }
+        }
 
         reused = 0;
         c->hc = h3_pool_take(host, port);
@@ -896,9 +987,17 @@ static int http3_close(URLContext *h)
     return 0;
 }
 
+static const AVOption http3_options[] = {
+    { "altsvc", "discover HTTP/3 via the Alt-Svc header before connecting",
+      offsetof(HTTP3Context, altsvc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1,
+      AV_OPT_FLAG_DECODING_PARAM },
+    { NULL }
+};
+
 static const AVClass http3_class = {
     .class_name = "http3",
     .item_name  = av_default_item_name,
+    .option     = http3_options,
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
