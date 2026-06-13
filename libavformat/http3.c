@@ -1,5 +1,7 @@
 /*
- * HTTP/3 (QUIC) protocol for FFmpeg — work in progress.
+ * HTTP/3 (QUIC) protocol for FFmpeg.
+ *
+ * Copyright (c) 2026 Simon Christ
  *
  * This file is part of FFmpeg.
  *
@@ -15,12 +17,14 @@
  */
 
 /*
- * QUIC transport (ngtcp2 + BoringSSL crypto helper) + HTTP/3 client (nghttp3):
- * seekable GETs with Range, response-status handling and redirect following.
- * BoringSSL backend (vs the earlier GnuTLS one) so this builds for iOS/mobile.
+ * QUIC transport (ngtcp2) + HTTP/3 client (nghttp3): seekable GETs with Range,
+ * response-status handling and redirect following. The TLS crypto backend
+ * follows FFmpeg's TLS selection: GnuTLS with --enable-gnutls, otherwise the
+ * OpenSSL-family helper (validated against BoringSSL, which is what makes this
+ * usable on iOS/mobile).
  *
  * Connection vs request split: the QUIC/H3 connection lives in a heap H3Conn
- * (stable address — ngtcp2/nghttp3/BoringSSL store a pointer to it as their
+ * (stable address — ngtcp2/nghttp3/the TLS lib store a pointer to it as their
  * user_data, and there is no set_user_data to retarget after creation). The
  * per-URLContext request state lives in HTTP3Context; H3Conn->cur points at the
  * request that currently owns the connection. That indirection is what lets a
@@ -40,12 +44,25 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "config.h"
+
+/* QUIC needs a TLS library with a QUIC interface. The crypto backend follows
+   FFmpeg's own TLS selection: --enable-gnutls -> GnuTLS, otherwise the
+   OpenSSL-family path (validated against BoringSSL, which is the only
+   OpenSSL-API TLS with a QUIC interface usable on e.g. iOS). quictls/OpenSSL
+   3.5 native QUIC is a documented follow-up. */
+#if CONFIG_GNUTLS
+#include <gnutls/gnutls.h>
+#include <gnutls/crypto.h>
+#include <ngtcp2/ngtcp2_crypto_gnutls.h>
+#else
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#include <ngtcp2/ngtcp2_crypto_boringssl.h>
+#endif
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
-#include <ngtcp2/ngtcp2_crypto_boringssl.h>
 #include <nghttp3/nghttp3.h>
 
 #include "libavutil/avstring.h"
@@ -69,8 +86,13 @@ typedef struct H3Conn {
     ngtcp2_conn *conn;
     nghttp3_conn *h3conn;
     ngtcp2_crypto_conn_ref conn_ref;
+#if CONFIG_GNUTLS
+    gnutls_session_t session;
+    gnutls_certificate_credentials_t cred;
+#else
     SSL_CTX *ssl_ctx;
     SSL *ssl;
+#endif
 
     struct sockaddr_storage local_addr, remote_addr;
     socklen_t local_addrlen, remote_addrlen;
@@ -81,6 +103,13 @@ typedef struct H3Conn {
 
     HTTP3Context *cur; /* request currently driving this connection */
 } H3Conn;
+
+/* native TLS handle ngtcp2 drives, per backend */
+#if CONFIG_GNUTLS
+#define H3_TLS_HANDLE(hc) ((hc)->session)
+#else
+#define H3_TLS_HANDLE(hc) ((hc)->ssl)
+#endif
 
 /* Per-URLContext request state. */
 struct HTTP3Context {
@@ -126,6 +155,16 @@ static ngtcp2_conn *h3_get_conn(ngtcp2_crypto_conn_ref *ref)
     return ((H3Conn *)ref->user_data)->conn;
 }
 
+/* backend-neutral CSPRNG; 0 on success, <0 on failure */
+static int h3_random(uint8_t *dst, size_t len)
+{
+#if CONFIG_GNUTLS
+    return gnutls_rnd(GNUTLS_RND_RANDOM, dst, len) == 0 ? 0 : -1;
+#else
+    return RAND_bytes(dst, len) == 1 ? 0 : -1;
+#endif
+}
+
 static int h3_buf_append(HTTP3Context *c, const uint8_t *data, size_t len)
 {
     if (c->rb_len + len > c->rb_size) {
@@ -146,14 +185,14 @@ static int h3_buf_append(HTTP3Context *c, const uint8_t *data, size_t len)
 
 static void h3_rand_cb(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *ctx)
 {
-    RAND_bytes(dest, destlen);
+    h3_random(dest, destlen);
 }
 
 static int h3_get_new_cid_cb(ngtcp2_conn *conn, ngtcp2_cid *cid, uint8_t *token,
                              size_t cidlen, void *user_data)
 {
     H3Conn *hc = user_data;
-    if (RAND_bytes(cid->data, cidlen) != 1)
+    if (h3_random(cid->data, cidlen) < 0)
         return NGTCP2_ERR_CALLBACK_FAILURE;
     cid->datalen = cidlen;
     if (ngtcp2_crypto_generate_stateless_reset_token(
@@ -274,29 +313,67 @@ static int h3_end_headers_cb(nghttp3_conn *conn, int64_t stream_id, int fin,
 
 static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
 {
-    static const uint8_t alpn[] = { 2, 'h', '3' };   /* wire format: len + "h3" */
-
-    hc->ssl_ctx = SSL_CTX_new(TLS_client_method());
-    if (!hc->ssl_ctx)
-        return AVERROR_EXTERNAL;
-    if (ngtcp2_crypto_boringssl_configure_client_context(hc->ssl_ctx) != 0)
-        return AVERROR_EXTERNAL;
-    SSL_CTX_set_default_verify_paths(hc->ssl_ctx);   /* system trust store */
-
-    hc->ssl = SSL_new(hc->ssl_ctx);
-    if (!hc->ssl)
-        return AVERROR_EXTERNAL;
-
     hc->conn_ref.get_conn  = h3_get_conn;
     hc->conn_ref.user_data = hc;
-    SSL_set_app_data(hc->ssl, &hc->conn_ref);   /* crypto helper finds the conn here */
-    SSL_set_connect_state(hc->ssl);
-    SSL_set_alpn_protos(hc->ssl, alpn, sizeof(alpn));
-    SSL_set_tlsext_host_name(hc->ssl, host);    /* SNI */
-    /* verify the server cert chain + match the hostname; the handshake fails on
-       an invalid/mismatched cert. */
-    SSL_set_verify(hc->ssl, SSL_VERIFY_PEER, NULL);
-    SSL_set1_host(hc->ssl, host);
+
+#if CONFIG_GNUTLS
+    {
+        int rv;
+        /* TLS 1.3 only, QUIC-compatible cipher/group set */
+        static const char priority[] =
+            "%DISABLE_TLS13_COMPAT_MODE:NORMAL:-VERS-ALL:+VERS-TLS1.3:"
+            "-CIPHER-ALL:+AES-128-GCM:+AES-256-GCM:+CHACHA20-POLY1305:+AES-128-CCM:"
+            "-GROUP-ALL:+GROUP-SECP256R1:+GROUP-SECP384R1:+GROUP-SECP521R1:"
+            "+GROUP-X25519:+GROUP-X448";
+        gnutls_datum_t alpn = { (unsigned char *)H3_ALPN, sizeof(H3_ALPN) - 1 };
+
+        if (gnutls_certificate_allocate_credentials(&hc->cred) != 0)
+            return AVERROR_EXTERNAL;
+        gnutls_certificate_set_x509_system_trust(hc->cred);
+
+        if (gnutls_init(&hc->session, GNUTLS_CLIENT) != 0)
+            return AVERROR_EXTERNAL;
+        if ((rv = gnutls_priority_set_direct(hc->session, priority, NULL)) != 0) {
+            av_log(h, AV_LOG_ERROR, "gnutls priority: %s\n", gnutls_strerror(rv));
+            return AVERROR_EXTERNAL;
+        }
+        if (ngtcp2_crypto_gnutls_configure_client_session(hc->session) != 0)
+            return AVERROR_EXTERNAL;
+
+        gnutls_session_set_ptr(hc->session, &hc->conn_ref);
+        if (gnutls_credentials_set(hc->session, GNUTLS_CRD_CERTIFICATE, hc->cred) != 0)
+            return AVERROR_EXTERNAL;
+        gnutls_alpn_set_protocols(hc->session, &alpn, 1, GNUTLS_ALPN_MANDATORY);
+        gnutls_server_name_set(hc->session, GNUTLS_NAME_DNS, host, strlen(host)); /* SNI */
+        /* verify the server cert chain + match the hostname; the handshake
+           fails on an invalid/mismatched cert. */
+        gnutls_session_set_verify_cert(hc->session, host, 0);
+    }
+#else
+    {
+        static const uint8_t alpn[] = { 2, 'h', '3' }; /* wire format: len + "h3" */
+
+        hc->ssl_ctx = SSL_CTX_new(TLS_client_method());
+        if (!hc->ssl_ctx)
+            return AVERROR_EXTERNAL;
+        if (ngtcp2_crypto_boringssl_configure_client_context(hc->ssl_ctx) != 0)
+            return AVERROR_EXTERNAL;
+        SSL_CTX_set_default_verify_paths(hc->ssl_ctx); /* system trust store */
+
+        hc->ssl = SSL_new(hc->ssl_ctx);
+        if (!hc->ssl)
+            return AVERROR_EXTERNAL;
+
+        SSL_set_app_data(hc->ssl, &hc->conn_ref); /* crypto helper finds the conn here */
+        SSL_set_connect_state(hc->ssl);
+        SSL_set_alpn_protos(hc->ssl, alpn, sizeof(alpn));
+        SSL_set_tlsext_host_name(hc->ssl, host);  /* SNI */
+        /* verify the server cert chain + match the hostname; the handshake
+           fails on an invalid/mismatched cert. */
+        SSL_set_verify(hc->ssl, SSL_VERIFY_PEER, NULL);
+        SSL_set1_host(hc->ssl, host);
+    }
+#endif
     return 0;
 }
 
@@ -360,11 +437,11 @@ static int h3_init_quic(URLContext *h, H3Conn *hc)
         .extend_max_stream_data   = h3_extend_max_stream_data_cb,
     };
 
-    RAND_bytes(hc->sr_secret, sizeof(hc->sr_secret));
+    h3_random(hc->sr_secret, sizeof(hc->sr_secret));
     scid.datalen = 17;
-    RAND_bytes(scid.data, scid.datalen);
+    h3_random(scid.data, scid.datalen);
     dcid.datalen = 18;
-    RAND_bytes(dcid.data, dcid.datalen);
+    h3_random(dcid.data, dcid.datalen);
 
     ngtcp2_settings_default(&settings);
     settings.initial_ts = h3_timestamp();
@@ -390,7 +467,7 @@ static int h3_init_quic(URLContext *h, H3Conn *hc)
         av_log(h, AV_LOG_ERROR, "ngtcp2_conn_client_new: %s\n", ngtcp2_strerror(rv));
         return AVERROR_EXTERNAL;
     }
-    ngtcp2_conn_set_tls_native_handle(hc->conn, hc->ssl);
+    ngtcp2_conn_set_tls_native_handle(hc->conn, H3_TLS_HANDLE(hc));
     /* let ngtcp2 emit keep-alive packets once idle 15s; the pool reaper pumps
        parked connections so these actually go out and the conn survives the
        30s idle timeout for reuse by a later request. */
@@ -580,8 +657,13 @@ static void h3conn_free(H3Conn *hc)
         return;
     if (hc->h3conn)  nghttp3_conn_del(hc->h3conn);
     if (hc->conn)    ngtcp2_conn_del(hc->conn);
+#if CONFIG_GNUTLS
+    if (hc->session) gnutls_deinit(hc->session);
+    if (hc->cred)    gnutls_certificate_free_credentials(hc->cred);
+#else
     if (hc->ssl)     SSL_free(hc->ssl);
     if (hc->ssl_ctx) SSL_CTX_free(hc->ssl_ctx);
+#endif
     if (hc->fd >= 0) close(hc->fd);
     av_free(hc);
 }
@@ -747,9 +829,14 @@ static int h3_status_error(int s)
 static int h3_altsvc_probe(URLContext *h, const char *host, int port)
 {
     struct addrinfo hints = { 0 }, *res = NULL, *ai;
+#if CONFIG_GNUTLS
+    gnutls_session_t s = NULL;
+    gnutls_certificate_credentials_t cred = NULL;
+#else
     SSL_CTX *ctx = NULL;
     SSL *ssl = NULL;
     static const uint8_t alpn[] = { 8, 'h','t','t','p','/','1','.','1' };
+#endif
     char portstr[12], req[512], buf[8192];
     int fd = -1, ret = AVERROR(EIO), n, off = 0;
     char *as, *eol, *h3, *v, *end, *colon;
@@ -769,6 +856,22 @@ static int h3_altsvc_probe(URLContext *h, const char *host, int port)
     if (fd < 0)
         return AVERROR(EIO);
 
+#if CONFIG_GNUTLS
+    if (gnutls_certificate_allocate_credentials(&cred) != 0) goto out;
+    gnutls_certificate_set_x509_system_trust(cred);
+    if (gnutls_init(&s, GNUTLS_CLIENT) != 0) goto out;
+    gnutls_set_default_priority(s);
+    gnutls_credentials_set(s, GNUTLS_CRD_CERTIFICATE, cred);
+    gnutls_server_name_set(s, GNUTLS_NAME_DNS, host, strlen(host));
+    gnutls_session_set_verify_cert(s, host, 0);
+    gnutls_transport_set_int(s, fd);
+    gnutls_handshake_set_timeout(s, 5000);
+    do { n = gnutls_handshake(s); } while (n < 0 && !gnutls_error_is_fatal(n));
+    if (n < 0) {
+        av_log(h, AV_LOG_WARNING, "alt-svc probe TLS: %s\n", gnutls_strerror(n));
+        goto out;
+    }
+#else
     ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) goto out;
     SSL_CTX_set_default_verify_paths(ctx);
@@ -783,12 +886,23 @@ static int h3_altsvc_probe(URLContext *h, const char *host, int port)
         av_log(h, AV_LOG_WARNING, "alt-svc probe TLS handshake failed\n");
         goto out;
     }
+#endif
 
     snprintf(req, sizeof(req),
              "HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: ffmpeg-http3/0.1\r\nConnection: close\r\n\r\n",
              host);
+#if CONFIG_GNUTLS
+    gnutls_record_send(s, req, strlen(req));
+    while (off < (int)sizeof(buf) - 1) {
+        n = gnutls_record_recv(s, buf + off, sizeof(buf) - 1 - off);
+        if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) continue;
+        if (n <= 0) break;
+        off += n;
+        buf[off] = 0;
+        if (strstr(buf, "\r\n\r\n")) break; /* headers complete */
+    }
+#else
     SSL_write(ssl, req, strlen(req));
-
     while (off < (int)sizeof(buf) - 1) {
         n = SSL_read(ssl, buf + off, sizeof(buf) - 1 - off);
         if (n <= 0) break;
@@ -796,6 +910,7 @@ static int h3_altsvc_probe(URLContext *h, const char *host, int port)
         buf[off] = 0;
         if (strstr(buf, "\r\n\r\n")) break; /* headers complete */
     }
+#endif
     buf[off] = 0;
 
     as = av_stristr(buf, "alt-svc:");
@@ -814,8 +929,13 @@ static int h3_altsvc_probe(URLContext *h, const char *host, int port)
     av_log(h, AV_LOG_INFO, "http3: Alt-Svc advertises h3 on port %d\n", ret);
 
 out:
+#if CONFIG_GNUTLS
+    if (s)    { gnutls_bye(s, GNUTLS_SHUT_WR); gnutls_deinit(s); }
+    if (cred) gnutls_certificate_free_credentials(cred);
+#else
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
     if (ctx) SSL_CTX_free(ctx);
+#endif
     if (fd >= 0) close(fd);
     return ret;
 }

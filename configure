@@ -7461,9 +7461,25 @@ enabled librabbitmq       && require_pkg_config librabbitmq "librabbitmq >= 0.7.
 enabled librav1e          && require_pkg_config librav1e "rav1e >= 0.5.0" rav1e.h rav1e_context_new
 enabled librist           && require_pkg_config librist "librist >= 0.2.7" librist/librist.h rist_receiver_create
 enabled libnghttp3        && require_pkg_config libnghttp3 libnghttp3 nghttp3/nghttp3.h nghttp3_version
-enabled libngtcp2         && require_pkg_config libngtcp2 libngtcp2 ngtcp2/ngtcp2.h ngtcp2_version &&
-                             { add_cflags -I/opt/boringssl/include;
-                               append libngtcp2_extralibs "-lngtcp2_crypto_boringssl -L/opt/boringssl/lib -lssl -lcrypto -lstdc++"; }
+enabled libngtcp2         && require_pkg_config libngtcp2 libngtcp2 ngtcp2/ngtcp2.h ngtcp2_version && {
+    # http3.c selects its crypto backend by CONFIG_GNUTLS; link the matching
+    # ngtcp2 crypto helper. The OpenSSL-family path is validated against
+    # BoringSSL (C++); its headers/libs come from the TLS enablement or the
+    # user's --extra-cflags/--extra-libs, never a hardcoded install prefix.
+    # quictls / OpenSSL 3.5 native QUIC (ossl helper) is a documented follow-up.
+    if enabled gnutls; then
+        append libngtcp2_extralibs "-lngtcp2_crypto_gnutls"
+        # http3.c + the gnutls crypto helper call gnutls directly; make sure
+        # gnutls is on the link line even if no other gnutls user is built
+        append libngtcp2_extralibs $($pkg_config --libs gnutls 2>/dev/null || echo -lgnutls)
+    else
+        append libngtcp2_extralibs "-lngtcp2_crypto_boringssl"
+        if test "$target_os" = darwin; then
+            append libngtcp2_extralibs "-lc++"
+        else
+            append libngtcp2_extralibs "-lstdc++"
+        fi
+    fi; }
 enabled librsvg           && require_pkg_config librsvg librsvg-2.0 librsvg-2.0/librsvg/rsvg.h rsvg_handle_new_from_data
 enabled librtmp           && require_pkg_config librtmp librtmp librtmp/rtmp.h RTMP_Socket
 enabled librubberband     && require_pkg_config librubberband "rubberband >= 1.8.1" rubberband/rubberband-c.h rubberband_new -lstdc++ && append librubberband_extralibs "-lstdc++"

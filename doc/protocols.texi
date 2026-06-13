@@ -642,6 +642,32 @@ The required syntax to play a stream specifying a cookie is:
 ffplay -cookies "nlqptid=nltid=tsn; path=/; domain=somedomain.com;" http://somedomain.com/somestream.m3u8
 @end example
 
+@section http3
+
+HTTP/3 (RFC 9114): HTTP semantics carried over QUIC (RFC 9000) instead of TCP.
+This is a read-only client protocol for fetching resources (for example HLS
+segments or progressive media) over QUIC, with HTTP @code{Range} support for
+seeking and connection reuse across requests to the same host.
+
+QUIC needs a TLS library that exposes a QUIC interface. The crypto backend
+follows FFmpeg's own TLS selection: configure with @code{--enable-gnutls} to use
+GnuTLS, otherwise the OpenSSL-family backend is used (validated against
+BoringSSL). The protocol additionally requires @code{--enable-libngtcp2} (QUIC
+transport) and @code{--enable-libnghttp3} (HTTP/3 framing).
+
+By default the server is assumed to speak HTTP/3 on the requested (or default
+443) UDP port. Use the @option{altsvc} option to instead probe the origin over
+HTTPS first and follow the port it advertises in its @code{Alt-Svc} header.
+
+This protocol accepts the following options:
+
+@table @option
+@item altsvc
+If set to 1, before connecting, probe the origin over HTTPS (HTTP/1.1) and use
+the HTTP/3 authority advertised in its @code{Alt-Svc} response header instead of
+assuming HTTP/3 on the requested port. Default value is 0.
+@end table
+
 @section Icecast
 
 Icecast protocol (stream to Icecast servers)
