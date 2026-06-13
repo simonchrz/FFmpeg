@@ -151,6 +151,7 @@ struct HTTP3Context {
 
     int64_t open_timeout_us;
     int altsvc;            /* AVOption: discover h3 via Alt-Svc before connecting */
+    int tls_verify;        /* AVOption: verify the server certificate (default on) */
 };
 
 /* ---- connection pool (host-keyed, N slots, FIFO eviction) ---- */
@@ -406,6 +407,8 @@ static int h3_gnutls_verify(gnutls_session_t session)
 
 static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
 {
+    int verify = ((HTTP3Context *)h->priv_data)->tls_verify;
+
     hc->conn_ref.get_conn  = h3_get_conn;
     hc->conn_ref.user_data = hc;
 
@@ -440,12 +443,14 @@ static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
         gnutls_server_name_set(hc->session, GNUTLS_NAME_DNS, host, strlen(host)); /* SNI */
         /* verify the server cert chain + match the hostname; the handshake
            fails on an invalid/mismatched cert. */
+        if (verify) {
 #if defined(__APPLE__)
-        /* validate against the system keychain (no SSL_CERT_FILE on iOS) */
-        gnutls_session_set_verify_function(hc->session, h3_gnutls_verify);
+            /* validate against the system keychain (no SSL_CERT_FILE on iOS) */
+            gnutls_session_set_verify_function(hc->session, h3_gnutls_verify);
 #else
-        gnutls_session_set_verify_cert(hc->session, host, 0);
+            gnutls_session_set_verify_cert(hc->session, host, 0);
 #endif
+        }
     }
 #else
     {
@@ -491,8 +496,9 @@ static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
         SSL_set_tlsext_host_name(hc->ssl, host);  /* SNI */
         /* verify the server cert chain + match the hostname; the handshake
            fails on an invalid/mismatched cert. */
-        SSL_set_verify(hc->ssl, SSL_VERIFY_PEER, NULL);
-        SSL_set1_host(hc->ssl, host);
+        SSL_set_verify(hc->ssl, verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+        if (verify)
+            SSL_set1_host(hc->ssl, host);
     }
 #endif
     return 0;
@@ -1226,6 +1232,9 @@ static int http3_close(URLContext *h)
 static const AVOption http3_options[] = {
     { "altsvc", "discover HTTP/3 via the Alt-Svc header before connecting",
       offsetof(HTTP3Context, altsvc), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1,
+      AV_OPT_FLAG_DECODING_PARAM },
+    { "tls_verify", "verify the server certificate (0 to disable)",
+      offsetof(HTTP3Context, tls_verify), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1,
       AV_OPT_FLAG_DECODING_PARAM },
     { NULL }
 };
