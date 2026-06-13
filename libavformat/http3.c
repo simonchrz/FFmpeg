@@ -102,10 +102,11 @@ struct HTTP3Context {
     int64_t open_timeout_us;
 };
 
-/* ---- single-slot connection pool ---- */
+/* ---- connection pool (host-keyed, N slots, FIFO eviction) ---- */
 
+#define H3_POOL_MAX 8
 static AVMutex h3_pool_mutex = AV_MUTEX_INITIALIZER;
-static H3Conn *h3_pool_idle;
+static H3Conn *h3_pool[H3_POOL_MAX];
 
 /* ---- helpers ---- */
 
@@ -603,11 +604,15 @@ static int h3_dial(URLContext *h, H3Conn *hc, const char *portstr, int64_t timeo
 static H3Conn *h3_pool_take(const char *host, int port)
 {
     H3Conn *hc = NULL;
+    int i;
     ff_mutex_lock(&h3_pool_mutex);
-    if (h3_pool_idle && h3_pool_idle->port == port &&
-        !strcmp(h3_pool_idle->host, host)) {
-        hc = h3_pool_idle;
-        h3_pool_idle = NULL;
+    for (i = 0; i < H3_POOL_MAX; i++) {
+        if (h3_pool[i] && h3_pool[i]->port == port &&
+            !strcmp(h3_pool[i]->host, host)) {
+            hc = h3_pool[i];
+            h3_pool[i] = NULL;
+            break;
+        }
     }
     ff_mutex_unlock(&h3_pool_mutex);
     return hc;
@@ -615,10 +620,23 @@ static H3Conn *h3_pool_take(const char *host, int port)
 
 static void h3_pool_put(H3Conn *hc)
 {
-    H3Conn *evict;
+    H3Conn *evict = NULL;
+    int i;
     ff_mutex_lock(&h3_pool_mutex);
-    evict = h3_pool_idle;
-    h3_pool_idle = hc;
+    for (i = 0; i < H3_POOL_MAX; i++) {
+        if (!h3_pool[i]) {
+            h3_pool[i] = hc;
+            hc = NULL;
+            break;
+        }
+    }
+    if (hc) {
+        /* full: evict the oldest (slot 0), shift down, append the new one */
+        evict = h3_pool[0];
+        for (i = 1; i < H3_POOL_MAX; i++)
+            h3_pool[i - 1] = h3_pool[i];
+        h3_pool[H3_POOL_MAX - 1] = hc;
+    }
     ff_mutex_unlock(&h3_pool_mutex);
     h3conn_free(evict);
 }
