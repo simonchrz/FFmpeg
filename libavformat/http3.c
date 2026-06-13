@@ -20,8 +20,8 @@
  * QUIC transport (ngtcp2) + HTTP/3 client (nghttp3): seekable GETs with Range,
  * response-status handling and redirect following. The TLS crypto backend
  * follows FFmpeg's TLS selection: GnuTLS with --enable-gnutls, otherwise the
- * OpenSSL-family helper (validated against BoringSSL, which is what makes this
- * usable on iOS/mobile).
+ * OpenSSL-family helper -- BoringSSL (OPENSSL_IS_BORINGSSL, the iOS/mobile
+ * path) or OpenSSL 3.5+ native QUIC (the ossl helper). All three verified.
  *
  * Connection vs request split: the QUIC/H3 connection lives in a heap H3Conn
  * (stable address — ngtcp2/nghttp3/the TLS lib store a pointer to it as their
@@ -59,7 +59,15 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#if defined(OPENSSL_IS_BORINGSSL)
 #include <ngtcp2/ngtcp2_crypto_boringssl.h>
+#else
+#include <ngtcp2/ngtcp2_crypto_ossl.h>
+#endif
+#endif
+#if defined(__APPLE__)
+#include <Security/Security.h>
+#include <CoreFoundation/CoreFoundation.h>
 #endif
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
@@ -92,6 +100,9 @@ typedef struct H3Conn {
 #else
     SSL_CTX *ssl_ctx;
     SSL *ssl;
+#if !defined(OPENSSL_IS_BORINGSSL)
+    ngtcp2_crypto_ossl_ctx *ossl_ctx;   /* OpenSSL 3.5 native QUIC */
+#endif
 #endif
 
     struct sockaddr_storage local_addr, remote_addr;
@@ -107,8 +118,15 @@ typedef struct H3Conn {
 /* native TLS handle ngtcp2 drives, per backend */
 #if CONFIG_GNUTLS
 #define H3_TLS_HANDLE(hc) ((hc)->session)
-#else
+#elif defined(OPENSSL_IS_BORINGSSL)
 #define H3_TLS_HANDLE(hc) ((hc)->ssl)
+#else
+#define H3_TLS_HANDLE(hc) ((hc)->ossl_ctx)
+#endif
+
+#if !CONFIG_GNUTLS && !defined(OPENSSL_IS_BORINGSSL)
+static AVOnce h3_ossl_once = AV_ONCE_INIT;
+static void h3_ossl_global_init(void) { ngtcp2_crypto_ossl_init(); }
 #endif
 
 /* Per-URLContext request state. */
@@ -311,6 +329,81 @@ static int h3_end_headers_cb(nghttp3_conn *conn, int64_t stream_id, int fin,
 
 /* ---- connection bring-up ---- */
 
+#if CONFIG_GNUTLS && defined(__APPLE__)
+/* Verify the peer's DER certificate chain against the system keychain via
+   SecTrust. On iOS there is no /etc/ssl/certs nor SSL_CERT_FILE, so this is
+   how the chain (incl. a user-trusted local CA) is validated. */
+static int h3_apple_verify(const uint8_t **der, const size_t *der_len,
+                           size_t n, const char *host)
+{
+    CFMutableArrayRef certs;
+    CFStringRef cfhost;
+    SecPolicyRef policy;
+    SecTrustRef trust = NULL;
+    OSStatus st;
+    bool ok;
+    size_t i;
+
+    if (!n)
+        return -1;
+    certs = CFArrayCreateMutable(NULL, n, &kCFTypeArrayCallBacks);
+    if (!certs)
+        return -1;
+    for (i = 0; i < n; i++) {
+        CFDataRef d = CFDataCreate(NULL, der[i], der_len[i]);
+        SecCertificateRef c = d ? SecCertificateCreateWithData(NULL, d) : NULL;
+        if (d)
+            CFRelease(d);
+        if (!c) {
+            CFRelease(certs);
+            return -1;
+        }
+        CFArrayAppendValue(certs, c);
+        CFRelease(c);
+    }
+    cfhost = CFStringCreateWithCString(NULL, host, kCFStringEncodingUTF8);
+    policy = SecPolicyCreateSSL(true, cfhost);
+    if (cfhost)
+        CFRelease(cfhost);
+    st = SecTrustCreateWithCertificates(certs, policy, &trust);
+    if (policy)
+        CFRelease(policy);
+    CFRelease(certs);
+    if (st != errSecSuccess || !trust) {
+        if (trust)
+            CFRelease(trust);
+        return -1;
+    }
+    ok = SecTrustEvaluateWithError(trust, NULL);
+    CFRelease(trust);
+    return ok ? 0 : -1;
+}
+
+/* gnutls per-session verify hook: pull the peer DER chain and hand it to
+   SecTrust (replaces gnutls_session_set_verify_cert on Apple). */
+static int h3_gnutls_verify(gnutls_session_t session)
+{
+    ngtcp2_crypto_conn_ref *ref = gnutls_session_get_ptr(session);
+    H3Conn *hc = ref ? ref->user_data : NULL;
+    const gnutls_datum_t *peers;
+    const uint8_t *der[16];
+    size_t len[16];
+    unsigned int n = 0, i;
+
+    peers = gnutls_certificate_get_peers(session, &n);
+    if (!hc || !peers || !n)
+        return GNUTLS_E_CERTIFICATE_ERROR;
+    if (n > 16)
+        n = 16;
+    for (i = 0; i < n; i++) {
+        der[i] = peers[i].data;
+        len[i] = peers[i].size;
+    }
+    return h3_apple_verify(der, len, n, hc->host) == 0
+               ? 0 : GNUTLS_E_CERTIFICATE_ERROR;
+}
+#endif
+
 static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
 {
     hc->conn_ref.get_conn  = h3_get_conn;
@@ -347,7 +440,12 @@ static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
         gnutls_server_name_set(hc->session, GNUTLS_NAME_DNS, host, strlen(host)); /* SNI */
         /* verify the server cert chain + match the hostname; the handshake
            fails on an invalid/mismatched cert. */
+#if defined(__APPLE__)
+        /* validate against the system keychain (no SSL_CERT_FILE on iOS) */
+        gnutls_session_set_verify_function(hc->session, h3_gnutls_verify);
+#else
         gnutls_session_set_verify_cert(hc->session, host, 0);
+#endif
     }
 #else
     {
@@ -356,13 +454,36 @@ static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
         hc->ssl_ctx = SSL_CTX_new(TLS_client_method());
         if (!hc->ssl_ctx)
             return AVERROR_EXTERNAL;
+#if defined(OPENSSL_IS_BORINGSSL)
         if (ngtcp2_crypto_boringssl_configure_client_context(hc->ssl_ctx) != 0)
             return AVERROR_EXTERNAL;
+#endif
         SSL_CTX_set_default_verify_paths(hc->ssl_ctx); /* system trust store */
+#if !defined(OPENSSL_IS_BORINGSSL)
+        /* OpenSSL 3.5 has no ngtcp2 *context* configure (unlike BoringSSL);
+           set the QUIC-compatible TLS 1.3 ciphersuites + key-exchange groups
+           the ossl helper expects, or the handshake fails with ERR_CRYPTO. */
+        if (SSL_CTX_set_ciphersuites(hc->ssl_ctx,
+                "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
+                "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_CCM_SHA256") != 1 ||
+            SSL_CTX_set1_groups_list(hc->ssl_ctx,
+                "X25519:P-256:P-384:P-521:X25519MLKEM768") != 1)
+            return AVERROR_EXTERNAL;
+#endif
 
         hc->ssl = SSL_new(hc->ssl_ctx);
         if (!hc->ssl)
             return AVERROR_EXTERNAL;
+
+#if !defined(OPENSSL_IS_BORINGSSL)
+        /* OpenSSL 3.5 native QUIC: per-session crypto ctx bound to the SSL */
+        ff_thread_once(&h3_ossl_once, h3_ossl_global_init);
+        if (ngtcp2_crypto_ossl_ctx_new(&hc->ossl_ctx, NULL) != 0)
+            return AVERROR_EXTERNAL;
+        ngtcp2_crypto_ossl_ctx_set_ssl(hc->ossl_ctx, hc->ssl);
+        if (ngtcp2_crypto_ossl_configure_client_session(hc->ssl) != 0)
+            return AVERROR_EXTERNAL;
+#endif
 
         SSL_set_app_data(hc->ssl, &hc->conn_ref); /* crypto helper finds the conn here */
         SSL_set_connect_state(hc->ssl);
@@ -661,6 +782,9 @@ static void h3conn_free(H3Conn *hc)
     if (hc->session) gnutls_deinit(hc->session);
     if (hc->cred)    gnutls_certificate_free_credentials(hc->cred);
 #else
+#if !defined(OPENSSL_IS_BORINGSSL)
+    if (hc->ossl_ctx) ngtcp2_crypto_ossl_ctx_del(hc->ossl_ctx);
+#endif
     if (hc->ssl)     SSL_free(hc->ssl);
     if (hc->ssl_ctx) SSL_CTX_free(hc->ssl_ctx);
 #endif

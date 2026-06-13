@@ -7472,13 +7472,17 @@ enabled libngtcp2         && require_pkg_config libngtcp2 libngtcp2 ngtcp2/ngtcp
         # http3.c + the gnutls crypto helper call gnutls directly; make sure
         # gnutls is on the link line even if no other gnutls user is built
         append libngtcp2_extralibs $($pkg_config --libs gnutls 2>/dev/null || echo -lgnutls)
-    else
+    elif check_cpp_condition ngtcp2_boringssl openssl/crypto.h "defined(OPENSSL_IS_BORINGSSL)"; then
         append libngtcp2_extralibs "-lngtcp2_crypto_boringssl"
+        # BoringSSL is C++
         if test "$target_os" = darwin; then
             append libngtcp2_extralibs "-lc++"
         else
             append libngtcp2_extralibs "-lstdc++"
         fi
+    else
+        # OpenSSL 3.5+ native QUIC via the ngtcp2 ossl helper (C, no C++ runtime)
+        append libngtcp2_extralibs "-lngtcp2_crypto_ossl"
     fi; }
 enabled librsvg           && require_pkg_config librsvg librsvg-2.0 librsvg-2.0/librsvg/rsvg.h rsvg_handle_new_from_data
 enabled librtmp           && require_pkg_config librtmp librtmp librtmp/rtmp.h RTMP_Socket
