@@ -23,6 +23,8 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
 #include <netdb.h>
 #include <poll.h>
 #include <string.h>
@@ -70,8 +72,11 @@ typedef struct HTTP3Context {
     char host[1024];
     char path[2048];
 
-    int64_t stream_id;     /* request stream */
+    int64_t stream_id;     /* current request stream */
     int     stream_done;   /* response stream finished */
+    int     status;        /* HTTP :status of the current response */
+    int64_t off;           /* logical read position (bytes delivered) */
+    int64_t filesize;      /* total resource size, -1 if unknown */
 
     /* response body buffer */
     unsigned char *rb;
@@ -193,7 +198,40 @@ static int h3_http_recv_data_cb(nghttp3_conn *conn, int64_t stream_id,
                                 void *user_data, void *stream_user_data)
 {
     HTTP3Context *c = user_data;
+    if (stream_id != c->stream_id)   /* stale data from a cancelled (pre-seek) stream */
+        return 0;
     return h3_buf_append(c, data, datalen) < 0 ? NGHTTP3_ERR_CALLBACK_FAILURE : 0;
+}
+
+static int h3_recv_header_cb(nghttp3_conn *conn, int64_t stream_id, int32_t token,
+                             nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t flags,
+                             void *user_data, void *stream_user_data)
+{
+    HTTP3Context *c = user_data;
+    nghttp3_vec n, v;
+    char vb[128];
+    size_t vn;
+
+    if (stream_id != c->stream_id)
+        return 0;
+    n = nghttp3_rcbuf_get_buf(name);
+    v = nghttp3_rcbuf_get_buf(value);
+    vn = FFMIN(v.len, sizeof(vb) - 1);
+    memcpy(vb, v.base, vn);
+    vb[vn] = 0;
+
+    if (n.len == 7 && !av_strncasecmp((const char *)n.base, ":status", 7)) {
+        c->status = atoi(vb);
+    } else if (n.len == 13 && !av_strncasecmp((const char *)n.base, "content-range", 13)) {
+        /* "bytes X-Y/Z" -> total Z */
+        char *slash = strchr(vb, '/');
+        if (slash && slash[1] && slash[1] != '*')
+            c->filesize = strtoll(slash + 1, NULL, 10);
+    } else if (n.len == 14 && !av_strncasecmp((const char *)n.base, "content-length", 14)) {
+        if (c->status == 200)            /* full response: length == total size */
+            c->filesize = strtoll(vb, NULL, 10);
+    }
+    return 0;
 }
 
 static int h3_http_stream_close_cb(nghttp3_conn *conn, int64_t stream_id,
@@ -353,6 +391,7 @@ static int h3_setup_http3(URLContext *h, HTTP3Context *c)
     int rv;
     static const nghttp3_callbacks callbacks = {
         .recv_data    = h3_http_recv_data_cb,
+        .recv_header  = h3_recv_header_cb,
         .stream_close = h3_http_stream_close_cb,
     };
 
@@ -377,22 +416,44 @@ static int h3_setup_http3(URLContext *h, HTTP3Context *c)
     return 0;
 }
 
-static int h3_submit_request(URLContext *h, HTTP3Context *c)
+/* Start a GET on a fresh bidi stream; range_start>0 adds a Range header (for
+   seeking). Any previous request stream is cancelled and the body buffer reset. */
+static int h3_start_request(URLContext *h, HTTP3Context *c, int64_t range_start)
 {
     int rv;
+    char rangebuf[64];
+    size_t nvlen;
 #define MK_NV(N, V) { (uint8_t *)(N), (uint8_t *)(V), sizeof(N) - 1, strlen(V), NGHTTP3_NV_FLAG_NONE }
-    nghttp3_nv nva[] = {
+    nghttp3_nv nva[6] = {
         MK_NV(":method", "GET"),
         MK_NV(":scheme", "https"),
         { (uint8_t *)":authority", (uint8_t *)c->host, sizeof(":authority") - 1, strlen(c->host), NGHTTP3_NV_FLAG_NONE },
         { (uint8_t *)":path",      (uint8_t *)c->path, sizeof(":path") - 1,      strlen(c->path), NGHTTP3_NV_FLAG_NONE },
         MK_NV("user-agent", "ffmpeg-http3/0.1"),
     };
+    nvlen = 5;
+
+    /* cancel a previous (e.g. pre-seek) request stream */
+    if (c->stream_id >= 0 && !c->stream_done)
+        ngtcp2_conn_shutdown_stream(c->conn, 0, c->stream_id, NGHTTP3_H3_REQUEST_CANCELLED);
+
+    c->rb_len = c->rb_off = 0;
+    c->stream_done = 0;
+    c->status = 0;
+
+    if (range_start > 0) {
+        snprintf(rangebuf, sizeof(rangebuf), "bytes=%"PRId64"-", range_start);
+        nva[nvlen].name     = (uint8_t *)"range";
+        nva[nvlen].value    = (uint8_t *)rangebuf;
+        nva[nvlen].namelen  = 5;
+        nva[nvlen].valuelen = strlen(rangebuf);
+        nva[nvlen].flags    = NGHTTP3_NV_FLAG_NONE;
+        nvlen++;
+    }
 
     if (ngtcp2_conn_open_bidi_stream(c->conn, &c->stream_id, NULL) != 0)
         return AVERROR_EXTERNAL;
-    rv = nghttp3_conn_submit_request(c->h3conn, c->stream_id, nva,
-                                     FF_ARRAY_ELEMS(nva), NULL, c);
+    rv = nghttp3_conn_submit_request(c->h3conn, c->stream_id, nva, nvlen, NULL, c);
     if (rv != 0) {
         av_log(h, AV_LOG_ERROR, "submit_request: %s\n", nghttp3_strerror(rv));
         return AVERROR_EXTERNAL;
@@ -541,6 +602,8 @@ static int http3_open(URLContext *h, const char *uri, int flags)
 
     c->fd = -1;
     c->stream_id = -1;
+    c->filesize = -1;
+    c->off = 0;
     c->open_timeout_us = 15 * 1000000;
 
     av_url_split(NULL, 0, NULL, 0, c->host, sizeof(c->host), &port,
@@ -559,7 +622,7 @@ static int http3_open(URLContext *h, const char *uri, int flags)
     if ((ret = h3_init_quic(h, c)) < 0)                      goto fail;
     if ((ret = h3_handshake(h, c)) < 0)                      goto fail;
     if ((ret = h3_setup_http3(h, c)) < 0)                    goto fail;
-    if ((ret = h3_submit_request(h, c)) < 0)                 goto fail;
+    if ((ret = h3_start_request(h, c, 0)) < 0)               goto fail;
 
     av_log(h, AV_LOG_INFO, "http3: GET https://%s%s over HTTP/3\n", c->host, c->path);
     return 0;
@@ -586,10 +649,40 @@ static int http3_read(URLContext *h, unsigned char *buf, int size)
         int n = (int)FFMIN((size_t)size, c->rb_len - c->rb_off);
         memcpy(buf, c->rb + c->rb_off, n);
         c->rb_off += n;
+        c->off += n;
         if (c->rb_off >= c->rb_len)
             c->rb_off = c->rb_len = 0;
         return n;
     }
+}
+
+static int64_t http3_seek(URLContext *h, int64_t pos, int whence)
+{
+    HTTP3Context *c = h->priv_data;
+    int64_t newpos;
+    int ret;
+
+    if (whence == AVSEEK_SIZE)
+        return c->filesize >= 0 ? c->filesize : AVERROR(ENOSYS);
+    if (whence == SEEK_CUR)
+        newpos = c->off + pos;
+    else if (whence == SEEK_END) {
+        if (c->filesize < 0)
+            return AVERROR(ENOSYS);
+        newpos = c->filesize + pos;
+    } else {
+        newpos = pos; /* SEEK_SET */
+    }
+    if (newpos < 0)
+        return AVERROR(EINVAL);
+    if (newpos == c->off)
+        return c->off;
+
+    /* re-issue the GET with a Range starting at the new position */
+    if ((ret = h3_start_request(h, c, newpos)) < 0)
+        return ret;
+    c->off = newpos;
+    return newpos;
 }
 
 static int http3_close(URLContext *h)
@@ -620,6 +713,7 @@ const URLProtocol ff_http3_protocol = {
     .name            = "http3",
     .url_open        = http3_open,
     .url_read        = http3_read,
+    .url_seek        = http3_seek,
     .url_close       = http3_close,
     .priv_data_size  = sizeof(HTTP3Context),
     .priv_data_class = &http3_class,
