@@ -804,6 +804,13 @@ static int h3_pump(URLContext *h, H3Conn *hc, int timeout_ms)
     uint64_t now;
     int pr, d;
 
+    /* Honor the ffmpeg interrupt callback (e.g. mpv player teardown) so a
+       blocking read returns promptly with AVERROR_EXIT instead of hanging the
+       demux thread in poll() until the timeout -- which would deadlock the
+       caller's pthread_join on shutdown. h is NULL for the keep-alive reaper. */
+    if (h && ff_check_interrupt(&h->interrupt_callback))
+        return AVERROR_EXIT;
+
     if (h3_write(h, hc) < 0)
         return AVERROR_EXTERNAL;
 
@@ -814,6 +821,10 @@ static int h3_pump(URLContext *h, H3Conn *hc, int timeout_ms)
         if (d < timeout_ms)
             timeout_ms = d;
     }
+    /* cap the wait so an interrupt arriving mid-poll is noticed within ~250ms
+       (callers loop on h3_pump until their own deadline) */
+    if (timeout_ms > 250)
+        timeout_ms = 250;
 
     pr = poll(&pfd, 1, timeout_ms);
     if (pr < 0)
