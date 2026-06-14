@@ -488,7 +488,19 @@ static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
     hc->conn_ref.get_conn  = h3_get_conn;
     hc->conn_ref.user_data = hc;
     av_strlcpy(hc->vhost, vhost, sizeof(hc->vhost));
-    av_strlcpy(hc->ca_file, c->ca_file ? c->ca_file : "", sizeof(hc->ca_file));
+    /* ca_file: AVOption bevorzugt, sonst Env-Fallback (KUCKUCK_H3_CA_FILE).
+       Der mpv-Weg (stream/demuxer-lavf-o-add "ca_file=...") erreichte die
+       private AVOption des http3-Protokolls auf dem Geraet nicht (c->ca_file
+       blieb NULL) -> Verify lief rein gegen den System-Trust-Store -> Fail auf
+       Geraeten ohne installiertes Caddy-CA-Profil. getenv() umgeht das gesamte
+       lavf-Options-Plumbing. hc->ca_file ist die EINE Quelle, aus der alle drei
+       Verify-Pfade lesen: gnutls-trust-file, openssl load_verify und der Apple
+       SecTrust-Anchor via h3_apple_verify(). */
+    {
+        const char *ca = (c->ca_file && *c->ca_file) ? c->ca_file
+                                                     : getenv("KUCKUCK_H3_CA_FILE");
+        av_strlcpy(hc->ca_file, ca ? ca : "", sizeof(hc->ca_file));
+    }
 
 #if CONFIG_GNUTLS
     {
@@ -522,8 +534,8 @@ static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
         /* verify the server cert chain + match the hostname; the handshake
            fails on an invalid/mismatched cert. */
         if (verify) {
-            if (c->ca_file && *c->ca_file)
-                gnutls_certificate_set_x509_trust_file(hc->cred, c->ca_file,
+            if (hc->ca_file[0])
+                gnutls_certificate_set_x509_trust_file(hc->cred, hc->ca_file,
                                                        GNUTLS_X509_FMT_PEM);
 #if defined(__APPLE__)
             /* validate via SecTrust (system keychain + optional ca_file anchor) */
@@ -579,8 +591,8 @@ static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
            fails on an invalid/mismatched cert. */
         SSL_set_verify(hc->ssl, verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
         if (verify) {
-            if (c->ca_file && *c->ca_file)
-                SSL_CTX_load_verify_locations(hc->ssl_ctx, c->ca_file, NULL);
+            if (hc->ca_file[0])
+                SSL_CTX_load_verify_locations(hc->ssl_ctx, hc->ca_file, NULL);
             SSL_set1_host(hc->ssl, vhost);
         }
     }
@@ -1065,6 +1077,17 @@ static int h3_altsvc_probe(URLContext *h, const char *host, int port)
     char portstr[12], req[512], buf[8192];
     int fd = -1, ret = AVERROR(EIO), n, off = 0;
     char *as, *eol, *h3, *v, *end, *colon;
+    /* Same cert-trust contract as the main h3 connection (h3_init_tls):
+       respect tls_verify/verifyhost and trust the extra ca_file anchor —
+       incl. the KUCKUCK_H3_CA_FILE env-fallback that bypasses mpv's
+       lavf-o options plumbing. Without this the discovery handshake
+       verifies only against the system store and would fail on devices
+       without the Caddy CA profile the instant alt-svc is enabled. */
+    HTTP3Context *c = h->priv_data;
+    int verify = c->tls_verify;
+    const char *vhost = (c->verifyhost && *c->verifyhost) ? c->verifyhost : host;
+    const char *ca = (c->ca_file && *c->ca_file) ? c->ca_file
+                                                 : getenv("KUCKUCK_H3_CA_FILE");
 
     snprintf(portstr, sizeof(portstr), "%d", port);
     hints.ai_family   = AF_UNSPEC;
@@ -1084,11 +1107,14 @@ static int h3_altsvc_probe(URLContext *h, const char *host, int port)
 #if CONFIG_GNUTLS
     if (gnutls_certificate_allocate_credentials(&cred) != 0) goto out;
     gnutls_certificate_set_x509_system_trust(cred);
+    if (ca && *ca)
+        gnutls_certificate_set_x509_trust_file(cred, ca, GNUTLS_X509_FMT_PEM);
     if (gnutls_init(&s, GNUTLS_CLIENT) != 0) goto out;
     gnutls_set_default_priority(s);
     gnutls_credentials_set(s, GNUTLS_CRD_CERTIFICATE, cred);
     gnutls_server_name_set(s, GNUTLS_NAME_DNS, host, strlen(host));
-    gnutls_session_set_verify_cert(s, host, 0);
+    if (verify)
+        gnutls_session_set_verify_cert(s, vhost, 0);
     gnutls_transport_set_int(s, fd);
     gnutls_handshake_set_timeout(s, 5000);
     do { n = gnutls_handshake(s); } while (n < 0 && !gnutls_error_is_fatal(n));
@@ -1100,12 +1126,14 @@ static int h3_altsvc_probe(URLContext *h, const char *host, int port)
     ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) goto out;
     SSL_CTX_set_default_verify_paths(ctx);
+    if (ca && *ca)
+        SSL_CTX_load_verify_locations(ctx, ca, NULL);
     ssl = SSL_new(ctx);
     if (!ssl) goto out;
     SSL_set_fd(ssl, fd);
     SSL_set_tlsext_host_name(ssl, host);
-    SSL_set1_host(ssl, host);
-    SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
+    SSL_set1_host(ssl, vhost);
+    SSL_set_verify(ssl, verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
     SSL_set_alpn_protos(ssl, alpn, sizeof(alpn));
     if (SSL_connect(ssl) != 1) {
         av_log(h, AV_LOG_WARNING, "alt-svc probe TLS handshake failed\n");
