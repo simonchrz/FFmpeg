@@ -24,7 +24,7 @@
  * path) or OpenSSL 3.5+ native QUIC (the ossl helper). All three verified.
  *
  * Connection vs request split: the QUIC/H3 connection lives in a heap H3Conn
- * (stable address — ngtcp2/nghttp3/the TLS lib store a pointer to it as their
+ * (stable address -- ngtcp2/nghttp3/the TLS lib store a pointer to it as their
  * user_data, and there is no set_user_data to retarget after creation). The
  * per-URLContext request state lives in HTTP3Context; H3Conn->cur points at the
  * request that currently owns the connection. That indirection is what lets a
@@ -488,19 +488,8 @@ static int h3_init_tls(URLContext *h, H3Conn *hc, const char *host)
     hc->conn_ref.get_conn  = h3_get_conn;
     hc->conn_ref.user_data = hc;
     av_strlcpy(hc->vhost, vhost, sizeof(hc->vhost));
-    /* ca_file: AVOption bevorzugt, sonst Env-Fallback (KUCKUCK_H3_CA_FILE).
-       Der mpv-Weg (stream/demuxer-lavf-o-add "ca_file=...") erreichte die
-       private AVOption des http3-Protokolls auf dem Geraet nicht (c->ca_file
-       blieb NULL) -> Verify lief rein gegen den System-Trust-Store -> Fail auf
-       Geraeten ohne installiertes Caddy-CA-Profil. getenv() umgeht das gesamte
-       lavf-Options-Plumbing. hc->ca_file ist die EINE Quelle, aus der alle drei
-       Verify-Pfade lesen: gnutls-trust-file, openssl load_verify und der Apple
-       SecTrust-Anchor via h3_apple_verify(). */
-    {
-        const char *ca = (c->ca_file && *c->ca_file) ? c->ca_file
-                                                     : getenv("KUCKUCK_H3_CA_FILE");
-        av_strlcpy(hc->ca_file, ca ? ca : "", sizeof(hc->ca_file));
-    }
+    /* extra CA anchor (PEM) to trust on top of the system store */
+    av_strlcpy(hc->ca_file, c->ca_file ? c->ca_file : "", sizeof(hc->ca_file));
 
 #if CONFIG_GNUTLS
     {
@@ -1060,7 +1049,7 @@ static int h3_status_error(int s)
 /* ---- URLProtocol ---- */
 
 /* Alt-Svc discovery: a plain TLS-over-TCP HTTP/1.1 HEAD to learn whether the
-   origin advertises HTTP/3 and on which port (RFC 9114 §3.1.1). Returns the
+   origin advertises HTTP/3 and on which port (RFC 9114 sec 3.1.1). Returns the
    advertised h3 port, or <0 if none. This is the "upgrade" path: instead of
    blindly assuming h3 (prior knowledge), confirm + discover the port first. */
 static int h3_altsvc_probe(URLContext *h, const char *host, int port)
@@ -1077,17 +1066,12 @@ static int h3_altsvc_probe(URLContext *h, const char *host, int port)
     char portstr[12], req[512], buf[8192];
     int fd = -1, ret = AVERROR(EIO), n, off = 0;
     char *as, *eol, *h3, *v, *end, *colon;
-    /* Same cert-trust contract as the main h3 connection (h3_init_tls):
-       respect tls_verify/verifyhost and trust the extra ca_file anchor —
-       incl. the KUCKUCK_H3_CA_FILE env-fallback that bypasses mpv's
-       lavf-o options plumbing. Without this the discovery handshake
-       verifies only against the system store and would fail on devices
-       without the Caddy CA profile the instant alt-svc is enabled. */
+    /* same cert-trust contract as the main h3 connection: honour
+       tls_verify/verifyhost and trust the extra ca_file anchor */
     HTTP3Context *c = h->priv_data;
     int verify = c->tls_verify;
     const char *vhost = (c->verifyhost && *c->verifyhost) ? c->verifyhost : host;
-    const char *ca = (c->ca_file && *c->ca_file) ? c->ca_file
-                                                 : getenv("KUCKUCK_H3_CA_FILE");
+    const char *ca = (c->ca_file && *c->ca_file) ? c->ca_file : NULL;
 
     snprintf(portstr, sizeof(portstr), "%d", port);
     hints.ai_family   = AF_UNSPEC;
